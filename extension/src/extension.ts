@@ -3,6 +3,11 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { parseSymbols, Sym } from './parser';
 import * as formatter from './formatter';
+import { CompletionProvider } from './providers/completionProvider';
+import { HoverProvider } from './providers/hoverProvider';
+import { WorkspaceSymbolProvider } from './providers/workspaceSymbolProvider';
+import { LanguageClient, LanguageClientOptions, ServerOptions, TransportKind } from 'vscode-languageclient/node';
+import { getPrioritizedFiles } from './utils/searchUtils';
 
 // Clean, single-file implementation for DocumentSymbols, DefinitionProvider
 // and unused-variable diagnostics for Genero 4GL.
@@ -375,20 +380,51 @@ function isDiagnosticEnabled(): boolean { const cfg = vscode.workspace.getConfig
 function getDiagnosticDelay(): number { const cfg = vscode.workspace.getConfiguration('GeneroFGL'); return cfg.get('4gl.diagnostic.delay', 500); }
 
 let diagnosticTimer: NodeJS.Timeout | undefined;
+let languageClient: LanguageClient | undefined;
 
 // --- Definition provider -------------------------------------------------
 class FourGLDefinitionProvider implements vscode.DefinitionProvider {
-  public async provideDefinition(document: vscode.TextDocument, position: vscode.Position): Promise<vscode.Location | null> {
+  public async provideDefinition(document: vscode.TextDocument, position: vscode.Position, token: vscode.CancellationToken): Promise<vscode.Location | null> {
     const wr = document.getWordRangeAtPosition(position, /[A-Za-z0-9_\.]+/);
     if (!wr) return null;
     const word = document.getText(wr);
 
+    // 1. Search in current file first
     const local = this.findDefinitionInText(document.getText(), word, document.uri);
     if (local) return local;
 
+    // 2. Search in prioritized library files/paths
+    //    這一步是效能優化的關鍵：若在優先目錄找到，立即返回，不再掃描整個工作區
+    const prioritizedFiles = await getPrioritizedFiles(token, ['.4gl']);
+    const checkedFiles = new Set<string>();
+
+    // Add current file to checked to avoid re-checking
+    checkedFiles.add(document.uri.toString());
+
+    for (const f of prioritizedFiles) {
+      if (token.isCancellationRequested) return null;
+      if (checkedFiles.has(f.toString())) continue;
+
+      try {
+        const doc = await vscode.workspace.openTextDocument(f);
+        const def = this.findDefinitionInText(doc.getText(), word, f);
+        if (def) {
+            checkedFiles.add(f.toString()); // 標記為已檢查
+            return def; // Early Exit!
+        }
+        checkedFiles.add(f.toString());
+      } catch (err) {
+        console.error(`[Genero FGL] Error searching definition in ${f.fsPath}`, err);
+      }
+    }
+
+    // 3. Search in remaining workspace files
+    //    只在前面兩步都找不到時才執行，且排除已檢查過的優先檔案
     const files = await vscode.workspace.findFiles('**/*.4gl');
     for (const f of files) {
-      if (f.toString() === document.uri.toString()) continue;
+      if (token.isCancellationRequested) return null;
+      if (checkedFiles.has(f.toString())) continue; // Skip if already checked in prioritized list or is current file
+
       try {
         const doc = await vscode.workspace.openTextDocument(f);
         const def = this.findDefinitionInText(doc.getText(), word, f);
@@ -413,11 +449,14 @@ class FourGLDefinitionProvider implements vscode.DefinitionProvider {
 export function activate(context: vscode.ExtensionContext) {
   console.log('[Genero FGL] activating');
 
+  const cfg = vscode.workspace.getConfiguration('GeneroFGL');
+  const lsEnabled = cfg.get('4gl.language-server.enable', false);
+  const completionEnabled4gl = cfg.get('4gl.completion.enable', true);
+  const completionEnabledPer = cfg.get('per.completion.enable', true);
+
   // If the experimental language-server setting is enabled, check that
   // a language server binary / script exists in the extension folder.
   try {
-    const cfg = vscode.workspace.getConfiguration('GeneroFGL');
-    const lsEnabled = cfg.get('4gl.language-server.enable', false);
     if (lsEnabled) {
       const extRoot = context.extensionPath || '';
       const candidates = [
@@ -433,6 +472,41 @@ export function activate(context: vscode.ExtensionContext) {
         vscode.window.showWarningMessage('Genero FGL: language server enabled but no server files found in the extension bundle. Language server features will be unavailable.');
       } else {
         console.log('[Genero FGL] language server candidate found at', found);
+
+        const lspDebugBreak = process && process.env && process.env.FGL_LSP_DEBUG === '1';
+        const lspExecArgv = lspDebugBreak
+          ? ['--nolazy', '--inspect-brk=6009']
+          : ['--nolazy', '--inspect=6009'];
+        const serverOptions: ServerOptions = {
+          run: { module: found, transport: TransportKind.ipc, options: { execArgv: lspExecArgv } },
+          debug: {
+            module: found,
+            transport: TransportKind.ipc,
+            options: { execArgv: lspExecArgv }
+          }
+        };
+        const localCompletionProvider = new CompletionProvider();
+        const clientOptions: LanguageClientOptions = {
+          documentSelector: [{ language: '4gl' }, { language: 'per' }],
+          synchronize: { configurationSection: 'GeneroFGL' },
+          middleware: {
+            provideCompletionItem: async (document, position, completionContext, token, next) => {
+              console.log('[Client] provideCompletionItem middleware called for', document.uri.toString(), 'at', position);
+              const result = await next(document, position, completionContext, token);
+              console.log('[Client] LSP returned:', result ? (Array.isArray(result) ? result.length + ' items' : 'CompletionList with ' + result.items?.length + ' items') : 'null/undefined');
+              const isEmptyArray = Array.isArray(result) && result.length === 0;
+              const isEmptyList = !Array.isArray(result) && result && Array.isArray(result.items) && result.items.length === 0;
+              if (!result || isEmptyArray || isEmptyList) {
+                console.log('[Client] LSP returned empty, using local fallback');
+                return localCompletionProvider.provideCompletionItems(document, position);
+              }
+              return result;
+            }
+          }
+        };
+        languageClient = new LanguageClient('genero-fgl-lsp', 'Genero FGL Language Server', serverOptions, clientOptions);
+        languageClient.start();
+        context.subscriptions.push({ dispose: () => languageClient && languageClient.stop() });
       }
     }
   } catch (err) {
@@ -441,6 +515,19 @@ export function activate(context: vscode.ExtensionContext) {
 
   context.subscriptions.push(vscode.languages.registerDocumentSymbolProvider({ language: '4gl' }, { provideDocumentSymbols(document: vscode.TextDocument) { return parseDocumentSymbols(document.getText()); } }));
   context.subscriptions.push(vscode.languages.registerDefinitionProvider({ language: '4gl' }, new FourGLDefinitionProvider()));
+  context.subscriptions.push(vscode.languages.registerHoverProvider({ language: '4gl' }, new HoverProvider()));
+  context.subscriptions.push(vscode.languages.registerHoverProvider({ language: 'per' }, new HoverProvider()));
+  context.subscriptions.push(vscode.languages.registerWorkspaceSymbolProvider(new WorkspaceSymbolProvider()));
+
+  // Register completion providers for both 4GL and PER files (fallback when LSP is disabled)
+  // Use trigger characters so keywords suggest on typing (e.g., "L" -> "LET").
+  const completionTriggers = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_'.split('');
+  if (!lsEnabled && completionEnabled4gl) {
+    context.subscriptions.push(vscode.languages.registerCompletionItemProvider({ language: '4gl' }, new CompletionProvider(), ...completionTriggers));
+  }
+  if (!lsEnabled && completionEnabledPer) {
+    context.subscriptions.push(vscode.languages.registerCompletionItemProvider({ language: 'per' }, new CompletionProvider(), ...completionTriggers));
+  }
 
   // Register formatting providers
   const docFormatter: vscode.DocumentFormattingEditProvider = {
@@ -569,12 +656,12 @@ export function activate(context: vscode.ExtensionContext) {
   const onOpen = vscode.workspace.onDidOpenTextDocument(doc => { if (doc.languageId === '4gl' && isDiagnosticEnabled()) diagProvider.updateDiagnostics(doc); });
   context.subscriptions.push(onOpen);
 
-  const cfg = vscode.workspace.onDidChangeConfiguration(ev => {
+  const cfgListener = vscode.workspace.onDidChangeConfiguration(ev => {
     if (ev.affectsConfiguration('GeneroFGL.4gl.diagnostic')) {
       vscode.workspace.textDocuments.forEach(d => { if (d.languageId === '4gl') { if (isDiagnosticEnabled()) diagProvider.updateDiagnostics(d); else diagProvider.clearDiagnostics(d.uri); } });
     }
   });
-  context.subscriptions.push(cfg);
+  context.subscriptions.push(cfgListener);
 
   // initial run
   vscode.workspace.textDocuments.forEach(d => { if (d.languageId === '4gl' && isDiagnosticEnabled()) diagProvider.updateDiagnostics(d); });
@@ -586,4 +673,9 @@ export function activate(context: vscode.ExtensionContext) {
   console.log('[Genero FGL] activated');
 }
 
-export function deactivate() {}
+export function deactivate() {
+  if (languageClient) {
+    languageClient.stop();
+    languageClient = undefined;
+  }
+}

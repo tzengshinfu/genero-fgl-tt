@@ -3,7 +3,7 @@
   "displayName": "Genero-FGL",
   "icon": "images/tiptop.ico",
   "description": "An essential tool designed to empower developers with a smooth and enjoyable experience when editing TIPTOP source code using Genero 4GL.",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "publisher": "m121752332",
   "repository": {
     "type": "git",
@@ -100,6 +100,14 @@
           "type": "boolean",
           "default": true,
           "description": "If true, normalize keywords to uppercase (only affects keyword tokens)."
+        },
+        "GeneroFGL.4gl.library.paths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Public library paths (file or directory). Workspace symbol search prioritizes these paths in order."
         },
         "GeneroFGL.4gl.definition.enable": {
           "type": "boolean",
@@ -425,6 +433,7 @@
     "esbuild-base": "esbuild ./src/extension.ts --bundle --outfile=out/main.js --external:vscode --format=cjs --platform=node",
     "esbuild": "npm run esbuild-base -- --sourcemap",
     "esbuild-watch": "npm run esbuild-base -- --sourcemap --watch",
+    "esbuild-lsp": "esbuild ./src/extension.ts --bundle --outfile=out/main.js --external:vscode --format=cjs --platform=node --sourcemap && esbuild ./src/server.ts --bundle --outfile=out/server.js --format=cjs --platform=node --sourcemap",
     "test-compile": "tsc -p ./",
     "test": "mocha -r ts-node/register --recursive unittests --reporter spec",
     "build-and-package": "node ./scripts/build-and-package.js",
@@ -447,7 +456,11 @@
   },
   "dependencies": {
     "vscode-languageclient": "8.1.0",
-    "@types/vscode": "^1.72.0"
+    "@types/vscode": "^1.72.0",
+    "vscode-languageserver": "^8.1.0",
+    "vscode-languageserver-textdocument": "^1.0.11",
+    "vscode-uri": "^2.1.1",
+    "request": "^2.88.0"
   },
   "dummy": {}
 }
