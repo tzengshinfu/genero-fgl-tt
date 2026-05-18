@@ -16,5 +16,11 @@
     "indentationRules": {
         "increaseIndentPattern": "(^((PUBLIC|PRIVATE|public|private)\\s)?(FUNCTION|function)\\b)|(^(MAIN|main)\\b)|(^\\s*(IF|WHILE|FOR|FOREACH|DISPLAY ARRAY|INPUT|if|while|for|foreach|display array|input)\\b)|((?<!(END|end)\\s)(RECORD|record|INTERFACE|interface)\\b)",
         "decreaseIndentPattern": "^\\s+(end|END)"
+    },
+    "folding": {
+        "markers": {
+            "start": "^\\s*--\\s*#region\\b",
+            "end": "^\\s*--\\s*#endregion\\b"
+        }
     }
 }
