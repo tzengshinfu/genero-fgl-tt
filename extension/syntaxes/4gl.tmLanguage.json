@@ -156,8 +156,15 @@
                     "name": "comment.line.double-dash.4gl"
                 },
                 {
-                    "begin": "{",
-                    "end": "}",
+                    "match": "\\{[^}]*\\}",
+                    "name": "comment.block.4gl"
+                },
+                {
+                    "match": "\\{.*$",
+                    "name": "comment.block.4gl"
+                },
+                {
+                    "match": "^\\s*\\}",
                     "name": "comment.block.4gl"
                 }
             ]

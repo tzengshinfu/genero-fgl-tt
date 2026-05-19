@@ -22,10 +22,18 @@
     "Debuggers"
   ],
   "activationEvents": [
+    "onLanguage:4gl",
+    "onLanguage:per",
     "onStartupFinished"
   ],
   "main": "./out/main.js",
   "contributes": {
+    "configurationDefaults": {
+      "[4gl]": {
+        "editor.foldingStrategy": "auto",
+        "editor.showFoldingControls": "always"
+      }
+    },
     "configuration": {
       "type": "object",
       "title": "Genero-FGL",

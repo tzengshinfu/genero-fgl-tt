@@ -35,6 +35,26 @@ interface EnhancedFunctionSignature {
   allParameters: string[];
 }
 
+let foldingOutputChannel: vscode.OutputChannel | undefined;
+
+function logFolding(...parts: unknown[]) {
+  const message = parts.map(part => typeof part === 'string' ? part : JSON.stringify(part)).join(' ');
+  console.log(message);
+  foldingOutputChannel?.appendLine(message);
+}
+
+async function probeFoldingRanges(document: vscode.TextDocument | undefined, reason: string) {
+  if (!document || document.languageId !== '4gl') return;
+  try {
+    logFolding('[Genero FGL] probing folding for', document.uri.toString(), 'reason=', reason);
+    const ranges = await vscode.commands.executeCommand<vscode.FoldingRange[]>('vscode.executeFoldingRangeProvider', document.uri);
+    logFolding('[Genero FGL] probe result =', (ranges ?? []).map(range => `${range.start}:${range.end}`).join(', ') || '(none)');
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    logFolding('[Genero FGL] probe failed =', message);
+  }
+}
+
 // --- Regex cache ----------------------------------------------------------
 const REGEX_PATTERNS = {
   FUNCTION: /^\s*(?:PUBLIC|PRIVATE|STATIC)?\s*FUNCTION\s+([A-Za-z0-9_]+)\b/i,
@@ -445,9 +465,82 @@ class FourGLDefinitionProvider implements vscode.DefinitionProvider {
   }
 }
 
+class FourGLCommentFoldingProvider implements vscode.FoldingRangeProvider {
+  provideFoldingRanges(document: vscode.TextDocument): vscode.FoldingRange[] {
+    logFolding('[Genero FGL] folding provider invoked for', document.uri.toString(), 'language=', document.languageId, 'lines=', document.lineCount);
+    const ranges: vscode.FoldingRange[] = [];
+    const lineCount = document.lineCount;
+    let commentStart = -1;
+    let commentType: 'hash' | 'dash' | null = null;
+    let blockCommentStart = -1;
+
+    const flushCommentRange = (endLine: number) => {
+      if (commentStart >= 0 && endLine > commentStart) {
+        ranges.push(new vscode.FoldingRange(commentStart, endLine, vscode.FoldingRangeKind.Comment));
+      }
+      commentStart = -1;
+      commentType = null;
+    };
+
+    for (let i = 0; i < lineCount; i++) {
+      const text = document.lineAt(i).text;
+      const trimmed = text.trim();
+      const isRegionMarker = /^\s*--\s*#(region|endregion)\b/i.test(text);
+
+      if (blockCommentStart >= 0) {
+        if (/^\s*}/.test(text)) {
+          if (i > blockCommentStart) {
+            ranges.push(new vscode.FoldingRange(blockCommentStart, i, vscode.FoldingRangeKind.Comment));
+          }
+          blockCommentStart = -1;
+        }
+        continue;
+      }
+
+      if (/^\s*{/.test(text) && !/^\s*{[^}]*}/.test(text)) {
+        flushCommentRange(i - 1);
+        blockCommentStart = i;
+        continue;
+      }
+
+      let currentCommentType: 'hash' | 'dash' | null = null;
+      if (/^\s*#/.test(text)) {
+        currentCommentType = 'hash';
+      } else if (/^\s*--/.test(text) && !isRegionMarker) {
+        currentCommentType = 'dash';
+      }
+
+      if (currentCommentType === null || trimmed.length === 0) {
+        flushCommentRange(i - 1);
+        continue;
+      }
+
+      if (commentStart < 0) {
+        commentStart = i;
+        commentType = currentCommentType;
+        continue;
+      }
+
+      if (commentType !== currentCommentType) {
+        flushCommentRange(i - 1);
+        commentStart = i;
+        commentType = currentCommentType;
+      }
+    }
+
+    flushCommentRange(lineCount - 1);
+
+    logFolding('[Genero FGL] folding ranges =', ranges.map(range => `${range.start}:${range.end}`).join(', ') || '(none)');
+
+    return ranges;
+  }
+}
+
 // --- Activation ----------------------------------------------------------
 export function activate(context: vscode.ExtensionContext) {
-  console.log('[Genero FGL] activating');
+  foldingOutputChannel = vscode.window.createOutputChannel('Genero FGL Folding');
+  context.subscriptions.push(foldingOutputChannel);
+  logFolding('[Genero FGL] activating');
 
   const cfg = vscode.workspace.getConfiguration('GeneroFGL');
   const lsEnabled = cfg.get('4gl.language-server.enable', false);
@@ -518,6 +611,11 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(vscode.languages.registerHoverProvider({ language: '4gl' }, new HoverProvider()));
   context.subscriptions.push(vscode.languages.registerHoverProvider({ language: 'per' }, new HoverProvider()));
   context.subscriptions.push(vscode.languages.registerWorkspaceSymbolProvider(new WorkspaceSymbolProvider()));
+  context.subscriptions.push(vscode.languages.registerFoldingRangeProvider({ language: '4gl' }, new FourGLCommentFoldingProvider()));
+  logFolding('[Genero FGL] folding provider registered for 4gl');
+  context.subscriptions.push(vscode.workspace.onDidOpenTextDocument(document => { void probeFoldingRanges(document, 'open'); }));
+  context.subscriptions.push(vscode.window.onDidChangeActiveTextEditor(editor => { void probeFoldingRanges(editor?.document, 'active-editor'); }));
+  void probeFoldingRanges(vscode.window.activeTextEditor?.document, 'activate');
 
   // Register completion providers for both 4GL and PER files (fallback when LSP is disabled)
   // Use trigger characters so keywords suggest on typing (e.g., "L" -> "LET").
@@ -592,8 +690,8 @@ export function activate(context: vscode.ExtensionContext) {
         console.log('[Genero FGL] range formatted preview (truncated):\n', formatted.split('\n').slice(0, 20).join('\n'));
         if (formatted === text) { console.log('[Genero FGL] range format produced no changes'); return []; }
         return [vscode.TextEdit.replace(range, formatted)];
-      } catch (err) { 
-        console.error('[Genero FGL] range format error', err); return []; 
+      } catch (err) {
+        console.error('[Genero FGL] range format error', err); return [];
       }
     }
   };
