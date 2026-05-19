@@ -55,6 +55,62 @@ async function probeFoldingRanges(document: vscode.TextDocument | undefined, rea
   }
 }
 
+type FoldingBlockKind =
+  | 'function'
+  | 'main'
+  | 'report'
+  | 'if'
+  | 'while'
+  | 'for'
+  | 'foreach'
+  | 'record'
+  | 'interface'
+  | 'construct'
+  | 'select'
+  | 'loop'
+  | 'display'
+  | 'input'
+  | 'case';
+
+function getFoldingBlockStartKind(trimmed: string): FoldingBlockKind | null {
+  if (/^(?:PUBLIC|PRIVATE|STATIC\s+)?FUNCTION\b/i.test(trimmed)) return 'function';
+  if (/^MAIN\b/i.test(trimmed)) return 'main';
+  if (/^REPORT\b/i.test(trimmed)) return 'report';
+  if (/^IF\b/i.test(trimmed)) return 'if';
+  if (/^WHILE\b/i.test(trimmed)) return 'while';
+  if (/^FOR\b/i.test(trimmed)) return 'for';
+  if (/^FOREACH\b/i.test(trimmed)) return 'foreach';
+  if (/^DISPLAY\s+ARRAY\b/i.test(trimmed)) return 'display';
+  if (/^INPUT\b/i.test(trimmed)) return 'input';
+  if (/^INTERFACE\b/i.test(trimmed)) return 'interface';
+  if (/^CONSTRUCT\b/i.test(trimmed)) return 'construct';
+  if (/^SELECT\b/i.test(trimmed)) return 'select';
+  if (/^LOOP\b/i.test(trimmed)) return 'loop';
+  if (/^CASE\b/i.test(trimmed)) return 'case';
+  if (/^TYPE\b.*\bRECORD\b/i.test(trimmed)) return 'record';
+  if (/^(?:DEFINE\b.*\b)?(?:DYNAMIC\s+ARRAY\s+OF\s+)?RECORD\b/i.test(trimmed)) return 'record';
+  return null;
+}
+
+function getFoldingBlockEndKind(trimmed: string): FoldingBlockKind | null {
+  if (/^END\s+FUNCTION\b/i.test(trimmed)) return 'function';
+  if (/^END\s+MAIN\b/i.test(trimmed)) return 'main';
+  if (/^END\s+REPORT\b/i.test(trimmed)) return 'report';
+  if (/^END\s+IF\b/i.test(trimmed)) return 'if';
+  if (/^END\s+WHILE\b/i.test(trimmed)) return 'while';
+  if (/^END\s+FOR\b/i.test(trimmed)) return 'for';
+  if (/^END\s+FOREACH\b/i.test(trimmed)) return 'foreach';
+  if (/^END\s+DISPLAY\b/i.test(trimmed)) return 'display';
+  if (/^END\s+INPUT\b/i.test(trimmed)) return 'input';
+  if (/^END\s+RECORD\b/i.test(trimmed)) return 'record';
+  if (/^END\s+INTERFACE\b/i.test(trimmed)) return 'interface';
+  if (/^END\s+CONSTRUCT\b/i.test(trimmed)) return 'construct';
+  if (/^END\s+SELECT\b/i.test(trimmed)) return 'select';
+  if (/^END\s+LOOP\b/i.test(trimmed)) return 'loop';
+  if (/^END\s+CASE\b/i.test(trimmed)) return 'case';
+  return null;
+}
+
 // --- Regex cache ----------------------------------------------------------
 const REGEX_PATTERNS = {
   FUNCTION: /^\s*(?:PUBLIC|PRIVATE|STATIC)?\s*FUNCTION\s+([A-Za-z0-9_]+)\b/i,
@@ -473,6 +529,8 @@ class FourGLCommentFoldingProvider implements vscode.FoldingRangeProvider {
     let commentStart = -1;
     let commentType: 'hash' | 'dash' | null = null;
     let blockCommentStart = -1;
+    const blockStack: Array<{ kind: FoldingBlockKind; line: number }> = [];
+    const regionStack: number[] = [];
 
     const flushCommentRange = (endLine: number) => {
       if (commentStart >= 0 && endLine > commentStart) {
@@ -482,10 +540,37 @@ class FourGLCommentFoldingProvider implements vscode.FoldingRangeProvider {
       commentType = null;
     };
 
+    const closeBlock = (kind: FoldingBlockKind, endLine: number) => {
+      for (let index = blockStack.length - 1; index >= 0; index--) {
+        if (blockStack[index].kind !== kind) continue;
+        const [block] = blockStack.splice(index, 1);
+        if (endLine > block.line) {
+          ranges.push(new vscode.FoldingRange(block.line, endLine));
+        }
+        return;
+      }
+    };
+
     for (let i = 0; i < lineCount; i++) {
       const text = document.lineAt(i).text;
       const trimmed = text.trim();
       const isRegionMarker = /^\s*--\s*#(region|endregion)\b/i.test(text);
+      const codeTrimmed = stripInlineComment(text).trim();
+
+      if (/^\s*--\s*#region\b/i.test(text)) {
+        flushCommentRange(i - 1);
+        regionStack.push(i);
+        continue;
+      }
+
+      if (/^\s*--\s*#endregion\b/i.test(text)) {
+        flushCommentRange(i - 1);
+        const regionStart = regionStack.pop();
+        if (typeof regionStart === 'number' && i > regionStart) {
+          ranges.push(new vscode.FoldingRange(regionStart, i, vscode.FoldingRangeKind.Region));
+        }
+        continue;
+      }
 
       if (blockCommentStart >= 0) {
         if (/^\s*}/.test(text)) {
@@ -503,6 +588,12 @@ class FourGLCommentFoldingProvider implements vscode.FoldingRangeProvider {
         continue;
       }
 
+      const endKind = getFoldingBlockEndKind(codeTrimmed);
+      if (endKind) {
+        flushCommentRange(i - 1);
+        closeBlock(endKind, i);
+      }
+
       let currentCommentType: 'hash' | 'dash' | null = null;
       if (/^\s*#/.test(text)) {
         currentCommentType = 'hash';
@@ -512,6 +603,10 @@ class FourGLCommentFoldingProvider implements vscode.FoldingRangeProvider {
 
       if (currentCommentType === null || trimmed.length === 0) {
         flushCommentRange(i - 1);
+        const startKind = getFoldingBlockStartKind(codeTrimmed);
+        if (startKind) {
+          blockStack.push({ kind: startKind, line: i });
+        }
         continue;
       }
 
