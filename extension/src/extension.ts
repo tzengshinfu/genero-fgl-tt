@@ -531,6 +531,18 @@ class FourGLCommentFoldingProvider implements vscode.FoldingRangeProvider {
     let blockCommentStart = -1;
     const blockStack: Array<{ kind: FoldingBlockKind; line: number }> = [];
     const regionStack: number[] = [];
+    const structuralLines = new Set<number>();
+
+    function getIndent(line: string): number {
+      const m = line.match(/^(\s*)/);
+      if (!m) return 0;
+      const s = m[1];
+      let indent = 0;
+      for (const ch of s) {
+        indent += ch === '\t' ? 4 : 1;
+      }
+      return indent;
+    }
 
     const flushCommentRange = (endLine: number) => {
       if (commentStart >= 0 && endLine > commentStart) {
@@ -544,8 +556,10 @@ class FourGLCommentFoldingProvider implements vscode.FoldingRangeProvider {
       for (let index = blockStack.length - 1; index >= 0; index--) {
         if (blockStack[index].kind !== kind) continue;
         const [block] = blockStack.splice(index, 1);
-        if (endLine > block.line) {
-          ranges.push(new vscode.FoldingRange(block.line, endLine));
+        structuralLines.add(block.line);
+        structuralLines.add(endLine);
+        if (endLine - 1 > block.line) {
+          ranges.push(new vscode.FoldingRange(block.line, endLine - 1));
         }
         return;
       }
@@ -559,12 +573,14 @@ class FourGLCommentFoldingProvider implements vscode.FoldingRangeProvider {
 
       if (/^\s*--\s*#region\b/i.test(text)) {
         flushCommentRange(i - 1);
+        structuralLines.add(i);
         regionStack.push(i);
         continue;
       }
 
       if (/^\s*--\s*#endregion\b/i.test(text)) {
         flushCommentRange(i - 1);
+        structuralLines.add(i);
         const regionStart = regionStack.pop();
         if (typeof regionStart === 'number' && i > regionStart) {
           ranges.push(new vscode.FoldingRange(regionStart, i, vscode.FoldingRangeKind.Region));
@@ -573,6 +589,7 @@ class FourGLCommentFoldingProvider implements vscode.FoldingRangeProvider {
       }
 
       if (blockCommentStart >= 0) {
+        structuralLines.add(i);
         if (/^\s*}/.test(text)) {
           if (i > blockCommentStart) {
             ranges.push(new vscode.FoldingRange(blockCommentStart, i, vscode.FoldingRangeKind.Comment));
@@ -584,6 +601,7 @@ class FourGLCommentFoldingProvider implements vscode.FoldingRangeProvider {
 
       if (/^\s*{/.test(text) && !/^\s*{[^}]*}/.test(text)) {
         flushCommentRange(i - 1);
+        structuralLines.add(i);
         blockCommentStart = i;
         continue;
       }
@@ -605,6 +623,7 @@ class FourGLCommentFoldingProvider implements vscode.FoldingRangeProvider {
         flushCommentRange(i - 1);
         const startKind = getFoldingBlockStartKind(codeTrimmed);
         if (startKind) {
+          structuralLines.add(i);
           blockStack.push({ kind: startKind, line: i });
         }
         continue;
@@ -624,6 +643,59 @@ class FourGLCommentFoldingProvider implements vscode.FoldingRangeProvider {
     }
 
     flushCommentRange(lineCount - 1);
+
+    const indentRanges: vscode.FoldingRange[] = [];
+    const indentStack: Array<{ indent: number; start: number }> = [];
+
+    const closeIndentBlocks = (endLine: number, minimumIndent = -1) => {
+      while (indentStack.length > 0 && indentStack[indentStack.length - 1].indent > minimumIndent) {
+        const last = indentStack.pop();
+        if (last && endLine > last.start) {
+          indentRanges.push(new vscode.FoldingRange(last.start, endLine));
+        }
+      }
+    };
+
+    let previousContentLine = -1;
+    let previousContentIndent = 0;
+
+    for (let i = 0; i < lineCount; i++) {
+      const text = document.lineAt(i).text;
+      const trimmed = text.trim();
+
+      if (trimmed.length === 0) {
+        closeIndentBlocks(i - 1);
+        previousContentLine = -1;
+        previousContentIndent = 0;
+        continue;
+      }
+
+      const indent = getIndent(text);
+      const isStructuralLine = structuralLines.has(i);
+
+      if (previousContentLine >= 0 && !structuralLines.has(previousContentLine) && indent > previousContentIndent) {
+        indentStack.push({ indent, start: previousContentLine });
+      }
+
+      if (indentStack.length > 0 && indent < indentStack[indentStack.length - 1].indent) {
+        closeIndentBlocks(i - 1, indent);
+      }
+
+      if (isStructuralLine) {
+        previousContentLine = -1;
+        previousContentIndent = 0;
+        continue;
+      }
+
+      previousContentLine = i;
+      previousContentIndent = indent;
+    }
+
+    closeIndentBlocks(lineCount - 1);
+
+    for (const range of indentRanges) {
+      ranges.push(range);
+    }
 
     logFolding('[Genero FGL] folding ranges =', ranges.map(range => `${range.start}:${range.end}`).join(', ') || '(none)');
 
