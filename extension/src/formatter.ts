@@ -188,10 +188,7 @@ function formatCodeWithIndent(code: string, indent: { useTabs?: boolean; size?: 
       continue;
     }
 
-    // If this rawLine is a closing (END) decrease first. Only END triggers
-    // a dedent per project rules: other sibling tokens (ELSE, ON, WHEN, etc.)
-    // must not force a decrease.
-    if (/^\s*END\b/i.test(rawLine)) {
+    if (isDecreaseBeforeLine(trimmed)) {
       level = Math.max(0, level - 1);
     }
 
@@ -211,16 +208,10 @@ function formatCodeWithIndent(code: string, indent: { useTabs?: boolean; size?: 
     const body = keywordsUppercase ? uppercaseKeywordsInCode(trimmed) : trimmed;
     outLines.push(getIndent(emitIndentLevel, size, useTabs) + body);
 
-    // Increase after lines that open blocks. Use a local pattern that matches
-    // the project's increaseIndentPattern (FUNCTION, MAIN, IF/WHILE/FOR/FOREACH/
-    // DISPLAY ARRAY/INPUT, RECORD, INTERFACE, etc.) but explicitly exclude
-    // SELECT so it won't be treated as a block opener.
-    const localIncreaseRe = /^(?:(?:(?:PUBLIC|PRIVATE)\s)?FUNCTION|MAIN|\s*(?:IF|WHILE|FOR|FOREACH|DISPLAY ARRAY|INPUT)|(?:RECORD|INTERFACE)|CONSTRUCT|LOOP)\b/i;
-    const localSiblingIncreaseRe = /^(?:ON\b|AFTER\b|BEFORE\b|WHEN\b)/i;
-    if (localIncreaseRe.test(trimmed)) {
+    if (isIncreaseAfterLine(trimmed)) {
       level++;
     }
-    if (localSiblingIncreaseRe.test(trimmed)) {
+    if (isSiblingIncreaseLine(trimmed)) {
       level++;
     }
   }
@@ -264,7 +255,7 @@ export function formatText(text: string, options?: { commentsStyle?: string; rep
       // If an ELSE or ELSEIF has trailing statements on the same line, split
       // them so the trailing statement is processed on the next line and gets
       // proper indentation.
-      codeFragment = codeFragment.replace(/(^\s*(ELSE|ELSEIF)\b)\s+([^\n]+)/igm, '$1\n$3');
+      codeFragment = codeFragment.replace(/(^\s*ELSE\b)\s+([^\n]+)/igm, '$1\n$2');
       // Aggressive normalization: ensure common statement keywords followed
       // by a string/next token have a single space. This converts
       // DISPLAY"..." into DISPLAY "..." and ensures trailing keywords
@@ -385,12 +376,6 @@ export function formatText(text: string, options?: { commentsStyle?: string; rep
     const useTabs = !!indent.useTabs;
     const lines = allText.split(/\r?\n/);
     let level = 0;
-    // Follow project rule: only END triggers a dedent. Do NOT treat SELECT
-    // as a block opener. Sibling tokens (ON/AFTER/BEFORE/WHEN) remain
-    // sibling-incrementers but do not cause an automatic dedent.
-    const increaseAfterRe = /^(?:((?:PUBLIC|PRIVATE)\s)?FUNCTION|MAIN|IF|FOR|WHILE|FOREACH|RECORD|INTERFACE|CONSTRUCT|LOOP)\b/i;
-    const siblingIncreaseRe = /^(?:ON\b|AFTER\b|BEFORE\b|WHEN\b)/i;
-    const decreaseBeforeRe = /^\s*(END\b)/i;
     const continuationEndRe = /(?:\|\|\s*$|,\s*$|\+\s*$)/;
     const continuationStartRe = /^\|\|/;
     const outLines: string[] = [];
@@ -410,17 +395,7 @@ export function formatText(text: string, options?: { commentsStyle?: string; rep
     for (let raw of lines) {
       if (!raw || /^\s*$/.test(raw)) { outLines.push(''); continue; }
       const trimmed = raw.trim();
-      // closing END: decrease before emitting. Per rule, ELSE/ELSEIF do not
-      // cause an automatic dedent here.
-      if (/^END\b/i.test(trimmed)) {
-        level = Math.max(0, level - 1);
-        outLines.push((useTabs ? '\t'.repeat(baseLevel + level) : ' '.repeat((baseLevel + level) * size)) + trimmed);
-        continue;
-      }
-
-      // if the line begins a sibling/block that should reduce previous nesting,
-      // apply decrease-before semantics (now only END matches decreaseBeforeRe)
-      if (decreaseBeforeRe.test(trimmed)) {
+      if (isDecreaseBeforeLine(trimmed)) {
         level = Math.max(0, level - 1);
       }
 
@@ -436,11 +411,10 @@ export function formatText(text: string, options?: { commentsStyle?: string; rep
 
       outLines.push((useTabs ? '\t'.repeat(baseLevel + emitLevel) : ' '.repeat((baseLevel + emitLevel) * size)) + trimmed);
 
-      // increase after opening keywords
-      if (increaseAfterRe.test(trimmed)) {
+      if (isIncreaseAfterLine(trimmed)) {
         level++;
       }
-      if (siblingIncreaseRe.test(trimmed)) {
+      if (isSiblingIncreaseLine(trimmed)) {
         level++;
       }
     }

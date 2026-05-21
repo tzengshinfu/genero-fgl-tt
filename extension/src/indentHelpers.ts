@@ -8,7 +8,7 @@ export function isIncreaseAfterLine(trimmed: string): boolean {
 
 export function isSiblingIncreaseLine(trimmed: string): boolean {
   if (!trimmed) return false;
-  return /^(?:ON\b|AFTER\b|BEFORE\b|WHEN\b)/i.test(trimmed);
+  return /^(?:ELSE\b|ELSEIF\b|ON\b|AFTER\b|BEFORE\b|WHEN\b)/i.test(trimmed);
 }
 
 export function isDecreaseBeforeLine(rawOrTrimmed: string): boolean {
