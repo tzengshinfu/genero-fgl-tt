@@ -43,6 +43,105 @@
           "default": true,
           "description": "Enable completion"
         },
+        "GeneroFGL.4gl.snippets": {
+          "type": "object",
+          "description": "4GL snippet definitions. Key = stable snippet ID; value = snippet definition.",
+          "default": {
+            "IF_BLOCK": {
+              "prefix": "if",
+              "description": "Insert IF ... END IF",
+              "body": [
+                "IF ${1:condition} THEN",
+                "   ${0}",
+                "END IF"
+              ],
+              "enabled": true
+            },
+            "IF_ELSE_BLOCK": {
+              "prefix": "ife",
+              "description": "Insert IF ... ELSE ... END IF",
+              "body": [
+                "IF ${1:condition} THEN",
+                "   ${0}",
+                "ELSE",
+                "   ",
+                "END IF"
+              ],
+              "enabled": true
+            },
+            "FOR_BLOCK": {
+              "prefix": "for",
+              "description": "Insert FOR loop",
+              "body": [
+                "FOR ${1:i} = ${2:1} TO ${3:n}",
+                "   ${0}",
+                "END FOR"
+              ],
+              "enabled": true
+            },
+            "WHILE_BLOCK": {
+              "prefix": "while",
+              "description": "Insert WHILE loop",
+              "body": [
+                "WHILE ${1:condition}",
+                "   ${0}",
+                "END WHILE"
+              ],
+              "enabled": true
+            },
+            "FOREACH_BLOCK": {
+              "prefix": "foreach",
+              "description": "Insert FOREACH loop",
+              "body": [
+                "FOREACH ${1:cursor} INTO ${2:var}",
+                "   ${0}",
+                "END FOREACH"
+              ],
+              "enabled": true
+            },
+            "FUNCTION_BLOCK": {
+              "prefix": "fn",
+              "description": "Insert FUNCTION block",
+              "body": [
+                "FUNCTION ${1:name}(${2:params})",
+                "   ${0}",
+                "END FUNCTION"
+              ],
+              "enabled": true
+            },
+            "CASE_BLOCK": {
+              "prefix": "case",
+              "description": "Insert CASE block",
+              "body": [
+                "CASE ${1:expr}",
+                "   WHEN ${2:value}",
+                "      ${0}",
+                "END CASE"
+              ],
+              "enabled": true
+            }
+          },
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "prefix": {
+                "type": "string"
+              },
+              "description": {
+                "type": "string"
+              },
+              "body": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "enabled": {
+                "type": "boolean"
+              }
+            }
+          }
+        },
         "GeneroFGL.4gl.diagnostic.delay": {
           "type": "number",
           "default": 500,

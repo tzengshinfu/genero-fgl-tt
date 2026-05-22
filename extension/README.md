@@ -19,6 +19,68 @@
 * debugging
 * tasks
 
+## Snippets
+
+The extension now provides configurable 4GL snippets through settings.
+
+Setting key:
+
+```json
+"GeneroFGL.4gl.snippets"
+```
+
+Each object key is a stable snippet id. The value defines the snippet:
+
+```json
+{
+  "prefix": "if",
+  "description": "Insert IF ... END IF",
+  "body": [
+    "IF ${1:condition} THEN",
+    "   ${0}",
+    "END IF"
+  ],
+  "enabled": true
+}
+```
+
+Behavior:
+
+* the extension ships default snippets in package.json
+* users can override a built-in snippet by reusing the same snippet id in settings.json
+* users can add new snippets by adding a new snippet id
+* setting `enabled` to `false` hides that snippet from completion
+
+Example:
+
+```json
+"GeneroFGL.4gl.snippets": {
+  "IF_BLOCK": {
+    "prefix": "ifi",
+    "description": "Custom IF block",
+    "body": [
+      "IF ${1:condition} THEN",
+      "      ${0}",
+      "END IF"
+    ],
+    "enabled": true
+  },
+  "SELECT_INTO": {
+    "prefix": "sel",
+    "description": "SELECT ... INTO template",
+    "body": [
+      "SELECT ${1:*}",
+      "  INTO ${2:target}.*",
+      "  FROM ${3:table}",
+      " WHERE ${0:condition}"
+    ],
+    "enabled": true
+  }
+}
+```
+
+The completion provider merges built-in snippets with user settings at runtime, so unchanged built-in snippets remain available.
+
 ## Debugging
 
 * launch using the internalConsole, integratedTerminal, externalTerminal.

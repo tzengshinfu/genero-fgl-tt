@@ -19,6 +19,68 @@
 * 除錯
 * 任務
 
+## Snippets
+
+擴充功能現在支援透過設定管理 4GL snippets。
+
+設定鍵：
+
+```json
+"GeneroFGL.4gl.snippets"
+```
+
+每個物件 key 是穩定的 snippet id，value 則是 snippet 定義：
+
+```json
+{
+  "prefix": "if",
+  "description": "Insert IF ... END IF",
+  "body": [
+    "IF ${1:condition} THEN",
+    "   ${0}",
+    "END IF"
+  ],
+  "enabled": true
+}
+```
+
+行為規則：
+
+* 擴充功能會在 package.json 內提供預設 snippets
+* 使用者可在 settings.json 使用相同 snippet id 覆蓋內建 snippet
+* 使用者可新增新的 snippet id 來擴充自己的 snippets
+* 將 `enabled` 設為 `false` 可隱藏該 snippet，不出現在補全列表
+
+範例：
+
+```json
+"GeneroFGL.4gl.snippets": {
+  "IF_BLOCK": {
+    "prefix": "ifi",
+    "description": "Custom IF block",
+    "body": [
+      "IF ${1:condition} THEN",
+      "      ${0}",
+      "END IF"
+    ],
+    "enabled": true
+  },
+  "SELECT_INTO": {
+    "prefix": "sel",
+    "description": "SELECT ... INTO template",
+    "body": [
+      "SELECT ${1:*}",
+      "  INTO ${2:target}.*",
+      "  FROM ${3:table}",
+      " WHERE ${0:condition}"
+    ],
+    "enabled": true
+  }
+}
+```
+
+補全提供器會在執行時合併內建 snippets 與使用者設定，所以沒有被覆蓋的內建 snippet 仍會保留。
+
 ## 除錯
 
 * 可使用 internalConsole、integratedTerminal、externalTerminal 啟動。

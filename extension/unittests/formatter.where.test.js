@@ -1,5 +1,6 @@
 const assert = require('assert');
-const fmt = require('../out/formatter') || require('../src/formatter');
+const path = require('path');
+const fmt = require(path.join('..', 'src', 'formatter'));
 
 describe('SELECT/WHERE indentation', function() {
   it('keeps WHERE on its own indented line (does not dedent to column 0)', function() {

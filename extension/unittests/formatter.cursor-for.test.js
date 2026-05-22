@@ -1,5 +1,6 @@
 const assert = require('assert');
-const fmt = require('../out/formatter') || require('../src/formatter');
+const path = require('path');
+const fmt = require(path.join('..', 'src', 'formatter'));
 
 describe('Keep CURSOR FOR together', function() {
   it('does not split CURSOR FOR across lines', function() {

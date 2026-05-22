@@ -6,6 +6,7 @@ import * as formatter from './formatter';
 import { CompletionProvider } from './providers/completionProvider';
 import { HoverProvider } from './providers/hoverProvider';
 import { WorkspaceSymbolProvider } from './providers/workspaceSymbolProvider';
+import { mergeCompletionResultsWithSnippets } from './providers/snippetProvider';
 import { LanguageClient, LanguageClientOptions, ServerOptions, TransportKind } from 'vscode-languageclient/node';
 import { getPrioritizedFiles } from './utils/searchUtils';
 import { computeFoldingRanges } from './folding';
@@ -533,13 +534,12 @@ export function activate(context: vscode.ExtensionContext) {
               console.log('[Client] provideCompletionItem middleware called for', document.uri.toString(), 'at', position);
               const result = await next(document, position, completionContext, token);
               console.log('[Client] LSP returned:', result ? (Array.isArray(result) ? result.length + ' items' : 'CompletionList with ' + result.items?.length + ' items') : 'null/undefined');
-              const isEmptyArray = Array.isArray(result) && result.length === 0;
-              const isEmptyList = !Array.isArray(result) && result && Array.isArray(result.items) && result.items.length === 0;
-              if (!result || isEmptyArray || isEmptyList) {
-                console.log('[Client] LSP returned empty, using local fallback');
-                return localCompletionProvider.provideCompletionItems(document, position);
+              const merged = mergeCompletionResultsWithSnippets(document, position, result);
+              if (!result) {
+                console.log('[Client] LSP returned empty, using merged local snippets/completions');
+                return merged;
               }
-              return result;
+              return merged;
             }
           }
         };

@@ -207,16 +207,13 @@ export function computeFoldingRanges(lines: string[]): SimpleFoldingRange[] {
     const trimmed = text.trim();
 
     if (trimmed.length === 0) {
-      closeIndentBlocks(i - 1);
-      previousContentLine = -1;
-      previousContentIndent = 0;
       continue;
     }
 
     const indent = getIndent(text);
     const isStructuralLine = structuralLines.has(i);
 
-    if (previousContentLine >= 0 && !structuralLines.has(previousContentLine) && !isStructuralLine && indent > previousContentIndent) {
+    if (previousContentLine >= 0 && !structuralLines.has(previousContentLine) && indent > previousContentIndent) {
       indentStack.push({ indent, start: previousContentLine });
     }
 
