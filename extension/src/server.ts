@@ -17,7 +17,10 @@ import {
   SignatureInformation,
   ParameterInformation,
   InlayHint,
-  InlayHintKind
+  InlayHintKind,
+  WorkspaceEdit,
+  TextEdit,
+  Range
 } from 'vscode-languageserver/node';
 import { TextDocument } from 'vscode-languageserver-textdocument';
 import * as fs from 'fs';
@@ -50,6 +53,9 @@ connection.onInitialize((params: InitializeParams): InitializeResult => {
       hoverProvider: true,
       definitionProvider: true,
       inlayHintProvider: true,
+      renameProvider: {
+        prepareProvider: true
+      },
       signatureHelpProvider: {
         triggerCharacters: ['(', ','],
         retriggerCharacters: [',']
@@ -550,6 +556,15 @@ interface CallContext {
   activeParameter: number;
 }
 
+type RenameTargetKind = 'function' | 'report';
+
+interface RenameTarget {
+  name: string;
+  kind: RenameTargetKind;
+  range: Range;
+  definitionUri: string;
+}
+
 function getCallContext(text: string, offset: number): CallContext | null {
   if (offset < 0 || offset > text.length) return null;
 
@@ -609,6 +624,195 @@ function buildSignatureHelp(signature: EnhancedFunctionSignature, activeParamete
     activeSignature: 0,
     activeParameter: parameters.length > 0 ? safeActiveParameter : 0
   };
+}
+
+function findFunctionDefinitionRangeInText(text: string, name: string): Range | null {
+  const lines = text.split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    const line = stripInlineComment(lines[i]);
+    const match = line.match(REGEX_PATTERNS.FUNCTION);
+    if (!match || match[1].toLowerCase() !== name.toLowerCase()) {
+      continue;
+    }
+    const start = line.toLowerCase().indexOf(match[1].toLowerCase());
+    if (start >= 0) {
+      return {
+        start: { line: i, character: start },
+        end: { line: i, character: start + match[1].length }
+      };
+    }
+  }
+  return null;
+}
+
+function findReportDefinitionRangeInText(text: string, name: string): Range | null {
+  const lines = text.split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    const line = stripInlineComment(lines[i]);
+    const match = line.match(REGEX_PATTERNS.REPORT);
+    if (!match || match[1].toLowerCase() !== name.toLowerCase()) {
+      continue;
+    }
+    const start = line.toLowerCase().indexOf(match[1].toLowerCase());
+    if (start >= 0) {
+      return {
+        start: { line: i, character: start },
+        end: { line: i, character: start + match[1].length }
+      };
+    }
+  }
+  return null;
+}
+
+function findSymbolDefinitionInText(text: string, name: string): { kind: RenameTargetKind; range: Range } | null {
+  const functionRange = findFunctionDefinitionRangeInText(text, name);
+  if (functionRange) {
+    return { kind: 'function', range: functionRange };
+  }
+  const reportRange = findReportDefinitionRangeInText(text, name);
+  if (reportRange) {
+    return { kind: 'report', range: reportRange };
+  }
+  return null;
+}
+
+function readTextByUri(uri: string, currentUri: string, currentText: string): string | null {
+  if (uri === currentUri) {
+    return currentText;
+  }
+  if (!uri.startsWith('file:')) {
+    return null;
+  }
+  try {
+    return fs.readFileSync(URI.parse(uri).fsPath, 'utf8');
+  } catch (error) {
+    console.error('[LSP] Error reading uri for rename', uri, error);
+    return null;
+  }
+}
+
+async function resolveRenameTarget(doc: TextDocument, offset: number): Promise<RenameTarget | null> {
+  const fullText = doc.getText();
+  const { word, start, end } = getWordAtPosition(fullText, offset);
+  if (!word) return null;
+
+  const localDefinition = findSymbolDefinitionInText(fullText, word);
+  if (localDefinition) {
+    return {
+      name: word,
+      kind: localDefinition.kind,
+      range: {
+        start: doc.positionAt(start),
+        end: doc.positionAt(end)
+      },
+      definitionUri: doc.uri
+    };
+  }
+
+  const definition = await findDefinition(word, doc.uri, fullText);
+  if (!definition) return null;
+
+  const definitionText = readTextByUri(definition.uri, doc.uri, fullText);
+  if (!definitionText) return null;
+  const resolved = findSymbolDefinitionInText(definitionText, word);
+  if (!resolved) return null;
+
+  return {
+    name: word,
+    kind: resolved.kind,
+    range: {
+      start: doc.positionAt(start),
+      end: doc.positionAt(end)
+    },
+    definitionUri: definition.uri
+  };
+}
+
+function collectRenameRangesInText(text: string, target: RenameTarget): Range[] {
+  const ranges: Range[] = [];
+  const seen = new Set<string>();
+  const escapedName = escapeRegExp(target.name);
+  const lines = text.split(/\r?\n/);
+
+  const pushRange = (line: number, start: number, end: number) => {
+    const key = `${line}:${start}:${end}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    ranges.push({
+      start: { line, character: start },
+      end: { line, character: end }
+    });
+  };
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = stripInlineComment(lines[i]);
+
+    if (target.kind === 'function') {
+      const defMatch = line.match(REGEX_PATTERNS.FUNCTION);
+      if (defMatch && defMatch[1].toLowerCase() === target.name.toLowerCase()) {
+        const start = line.toLowerCase().indexOf(defMatch[1].toLowerCase());
+        if (start >= 0) pushRange(i, start, start + defMatch[1].length);
+      }
+
+      const callRegex = new RegExp(`\\b${escapedName}\\b(?=\\s*\\()`, 'ig');
+      let callMatch: RegExpExecArray | null;
+      while ((callMatch = callRegex.exec(line)) !== null) {
+        pushRange(i, callMatch.index, callMatch.index + callMatch[0].length);
+      }
+
+      const callCommandRegex = new RegExp(`\\bCALL\\s+(${escapedName})\\b`, 'ig');
+      let commandMatch: RegExpExecArray | null;
+      while ((commandMatch = callCommandRegex.exec(line)) !== null) {
+        const start = commandMatch.index + commandMatch[0].length - commandMatch[1].length;
+        pushRange(i, start, start + commandMatch[1].length);
+      }
+    }
+
+    if (target.kind === 'report') {
+      const defMatch = line.match(REGEX_PATTERNS.REPORT);
+      if (defMatch && defMatch[1].toLowerCase() === target.name.toLowerCase()) {
+        const start = line.toLowerCase().indexOf(defMatch[1].toLowerCase());
+        if (start >= 0) pushRange(i, start, start + defMatch[1].length);
+      }
+
+      const reportRegex = new RegExp(`\\b(?:START\\s+)?REPORT\\s+(${escapedName})\\b`, 'ig');
+      let reportMatch: RegExpExecArray | null;
+      while ((reportMatch = reportRegex.exec(line)) !== null) {
+        const start = reportMatch.index + reportMatch[0].length - reportMatch[1].length;
+        pushRange(i, start, start + reportMatch[1].length);
+      }
+    }
+  }
+
+  return ranges;
+}
+
+function buildRenameWorkspaceEdit(target: RenameTarget, newName: string, currentUri: string, currentText: string): WorkspaceEdit {
+  const changes: Record<string, TextEdit[]> = {};
+  const currentPath = currentUri.startsWith('file:') ? URI.parse(currentUri).fsPath : currentUri;
+  const seen = new Set<string>([path.normalize(currentPath)]);
+
+  const pushFileEdits = (uri: string, text: string) => {
+    const ranges = collectRenameRangesInText(text, target);
+    if (ranges.length === 0) return;
+    changes[uri] = ranges.map(range => TextEdit.replace(range, newName));
+  };
+
+  pushFileEdits(currentUri, currentText);
+
+  for (const filePath of collectWorkspaceFiles(['.4gl'])) {
+    const normalized = path.normalize(filePath);
+    if (seen.has(normalized)) continue;
+    seen.add(normalized);
+    try {
+      const text = fs.readFileSync(filePath, 'utf8');
+      pushFileEdits(URI.file(filePath).toString(), text);
+    } catch (error) {
+      console.error('[LSP] Error building rename edits for', filePath, error);
+    }
+  }
+
+  return { changes };
 }
 
 interface CallSite {
@@ -1064,6 +1268,29 @@ connection.languages.inlayHint.on(async (params): Promise<InlayHint[]> => {
   const startOffset = doc.offsetAt(params.range.start);
   const endOffset = doc.offsetAt(params.range.end);
   return buildInlayHintsForRange(doc, startOffset, endOffset);
+});
+
+connection.onPrepareRename(async (params): Promise<Range | null> => {
+  const doc = documents.get(params.textDocument.uri);
+  if (!doc || doc.languageId !== '4gl') return null;
+
+  const offset = doc.offsetAt(params.position);
+  const target = await resolveRenameTarget(doc, offset);
+  return target?.range ?? null;
+});
+
+connection.onRenameRequest(async (params): Promise<WorkspaceEdit | null> => {
+  const doc = documents.get(params.textDocument.uri);
+  if (!doc || doc.languageId !== '4gl') return null;
+
+  const offset = doc.offsetAt(params.position);
+  const target = await resolveRenameTarget(doc, offset);
+  if (!target) return null;
+  if (!params.newName || !/^[A-Za-z_][A-Za-z0-9_]*$/u.test(params.newName)) {
+    return null;
+  }
+
+  return buildRenameWorkspaceEdit(target, params.newName, doc.uri, doc.getText());
 });
 
 function mapCompletionKind(type?: string): CompletionItemKind {
