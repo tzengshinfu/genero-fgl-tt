@@ -24,7 +24,9 @@ import {
   CallHierarchyItem,
   CallHierarchyIncomingCall,
   CallHierarchyOutgoingCall,
-  SymbolKind
+  SymbolKind,
+  SemanticTokens,
+  SemanticTokensBuilder
 } from 'vscode-languageserver/node';
 import { TextDocument } from 'vscode-languageserver-textdocument';
 import * as fs from 'fs';
@@ -37,6 +39,14 @@ import { ImportType } from './Handlers/importTypes';
 const connection = createConnection(ProposedFeatures.all);
 const documents: TextDocuments<TextDocument> = new TextDocuments(TextDocument);
 const workspaceFolders = new Set<string>();
+const SEMANTIC_TOKEN_TYPES = ['function', 'parameter', 'variable', 'type', 'keyword'] as const;
+const SEMANTIC_TOKEN_TYPE_INDEX: Record<(typeof SEMANTIC_TOKEN_TYPES)[number], number> = {
+  function: 0,
+  parameter: 1,
+  variable: 2,
+  type: 3,
+  keyword: 4
+};
 
 console.log('[LSP Server] Starting Genero FGL Language Server');
 
@@ -56,6 +66,13 @@ connection.onInitialize((params: InitializeParams): InitializeResult => {
       textDocumentSync: TextDocumentSyncKind.Incremental,
       hoverProvider: true,
       definitionProvider: true,
+      semanticTokensProvider: {
+        legend: {
+          tokenTypes: [...SEMANTIC_TOKEN_TYPES],
+          tokenModifiers: []
+        },
+        full: true
+      },
       inlayHintProvider: true,
       referencesProvider: true,
       callHierarchyProvider: true,
@@ -141,6 +158,13 @@ interface FunctionCallOccurrence {
   name: string;
   range: Range;
   argumentCount: number;
+}
+
+interface SemanticTokenEntry {
+  line: number;
+  char: number;
+  length: number;
+  tokenType: (typeof SEMANTIC_TOKEN_TYPES)[number];
 }
 
 interface EnhancedFunctionSignature {
@@ -510,6 +534,107 @@ function countArguments(argumentText: string): number {
     }
   }
   return count;
+}
+
+function collectSemanticTokens(text: string): SemanticTokenEntry[] {
+  const tokens: SemanticTokenEntry[] = [];
+  const seen = new Set<string>();
+  const lines = text.split(/\r?\n/);
+  const keywordNames = Array.from(new Set(KEYWORDS_4GL.map(keyword => keyword.name.toUpperCase()))).sort((a, b) => b.length - a.length);
+
+  const pushToken = (line: number, char: number, length: number, tokenType: (typeof SEMANTIC_TOKEN_TYPES)[number]) => {
+    if (line < 0 || char < 0 || length <= 0) return;
+    const key = `${line}:${char}:${length}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    tokens.push({ line, char, length, tokenType });
+  };
+
+  const pushWordOccurrences = (line: number, textLine: string, word: string, tokenType: (typeof SEMANTIC_TOKEN_TYPES)[number]) => {
+    const regex = new RegExp(`\\b${escapeRegExp(word)}\\b`, 'ig');
+    let match: RegExpExecArray | null;
+    while ((match = regex.exec(textLine)) !== null) {
+      pushToken(line, match.index, match[0].length, tokenType);
+    }
+  };
+
+  const mainBlock = extractMainBlock(text);
+  if (mainBlock) {
+    for (const variable of parseDefineStatements(mainBlock.content, mainBlock.startLine, 'main')) {
+      pushWordOccurrences(variable.line, lines[variable.line] || '', variable.name, 'variable');
+      const typeIndex = (lines[variable.line] || '').toUpperCase().indexOf(variable.type.toUpperCase());
+      if (typeIndex >= 0) {
+        pushToken(variable.line, typeIndex, variable.type.length, 'type');
+      }
+    }
+  }
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = stripInlineComment(lines[i]);
+
+    const functionMatch = line.match(REGEX_PATTERNS.FUNCTION);
+    if (functionMatch) {
+      const functionIndex = line.toLowerCase().indexOf(functionMatch[1].toLowerCase());
+      if (functionIndex >= 0) {
+        pushToken(i, functionIndex, functionMatch[1].length, 'function');
+      }
+    }
+
+    const reportMatch = line.match(REGEX_PATTERNS.REPORT);
+    if (reportMatch) {
+      const reportIndex = line.toLowerCase().indexOf(reportMatch[1].toLowerCase());
+      if (reportIndex >= 0) {
+        pushToken(i, reportIndex, reportMatch[1].length, 'function');
+      }
+    }
+
+    for (const keywordName of keywordNames) {
+      const regex = new RegExp(`\\b${escapeRegExp(keywordName)}\\b`, 'ig');
+      let match: RegExpExecArray | null;
+      while ((match = regex.exec(line)) !== null) {
+        pushToken(i, match.index, match[0].length, 'keyword');
+      }
+    }
+  }
+
+  for (const block of extractFunctionBlocks(text)) {
+    const signature = parseEnhancedFunctionSignature(block.content);
+    const signatureLine = lines[block.startLine] || '';
+    if (signature) {
+      for (const parameter of signature.allParameters) {
+        pushWordOccurrences(block.startLine, signatureLine, parameter, 'parameter');
+      }
+      for (let line = block.startLine + 1; line <= block.endLine; line++) {
+        const textLine = stripInlineComment(lines[line] || '');
+        for (const parameter of signature.allParameters) {
+          pushWordOccurrences(line, textLine, parameter, 'parameter');
+        }
+      }
+    }
+
+    for (const variable of parseDefineStatements(block.content, block.startLine, 'function')) {
+      pushWordOccurrences(variable.line, lines[variable.line] || '', variable.name, 'variable');
+      const typeIndex = (lines[variable.line] || '').toUpperCase().indexOf(variable.type.toUpperCase());
+      if (typeIndex >= 0) {
+        pushToken(variable.line, typeIndex, variable.type.length, 'type');
+      }
+    }
+
+    for (const call of collectFunctionCallOccurrences(block)) {
+      pushToken(call.range.start.line, call.range.start.character, call.name.length, 'function');
+    }
+  }
+
+  tokens.sort((a, b) => a.line - b.line || a.char - b.char || a.length - b.length);
+  return tokens;
+}
+
+function buildSemanticTokens(text: string): SemanticTokens {
+  const builder = new SemanticTokensBuilder();
+  for (const token of collectSemanticTokens(text)) {
+    builder.push(token.line, token.char, token.length, SEMANTIC_TOKEN_TYPE_INDEX[token.tokenType], 0);
+  }
+  return builder.build();
 }
 
 async function buildSemanticDiagnostics(document: TextDocument): Promise<Diagnostic[]> {
@@ -1641,6 +1766,14 @@ connection.onReferences(async (params): Promise<Location[]> => {
   if (!target) return [];
 
   return findReferences(target, doc.uri, doc.getText(), params.context.includeDeclaration === true);
+});
+
+connection.languages.semanticTokens.on((params): SemanticTokens => {
+  const doc = documents.get(params.textDocument.uri);
+  if (!doc || doc.languageId !== '4gl') {
+    return { data: [] };
+  }
+  return buildSemanticTokens(doc.getText());
 });
 
 connection.languages.callHierarchy.onPrepare(async (params): Promise<CallHierarchyItem[] | null> => {
