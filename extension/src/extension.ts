@@ -553,9 +553,11 @@ export function activate(context: vscode.ExtensionContext) {
   }
 
   context.subscriptions.push(vscode.languages.registerDocumentSymbolProvider({ language: '4gl' }, { provideDocumentSymbols(document: vscode.TextDocument) { return parseDocumentSymbols(document.getText()); } }));
-  context.subscriptions.push(vscode.languages.registerDefinitionProvider({ language: '4gl' }, new FourGLDefinitionProvider()));
-  context.subscriptions.push(vscode.languages.registerHoverProvider({ language: '4gl' }, new HoverProvider()));
-  context.subscriptions.push(vscode.languages.registerHoverProvider({ language: 'per' }, new HoverProvider()));
+  if (!lsEnabled) {
+    context.subscriptions.push(vscode.languages.registerDefinitionProvider({ language: '4gl' }, new FourGLDefinitionProvider()));
+    context.subscriptions.push(vscode.languages.registerHoverProvider({ language: '4gl' }, new HoverProvider()));
+    context.subscriptions.push(vscode.languages.registerHoverProvider({ language: 'per' }, new HoverProvider()));
+  }
   context.subscriptions.push(vscode.languages.registerWorkspaceSymbolProvider(new WorkspaceSymbolProvider()));
   context.subscriptions.push(vscode.languages.registerFoldingRangeProvider({ language: '4gl' }, new FourGLCommentFoldingProvider()));
   logFolding('[Genero FGL] folding provider registered for 4gl');
@@ -686,33 +688,34 @@ export function activate(context: vscode.ExtensionContext) {
     await vscode.commands.executeCommand('editor.action.formatRange', range);
   }));
 
-  const diagProvider = new UnusedVariableDiagnosticProvider();
-  context.subscriptions.push(diagProvider);
+  if (!lsEnabled) {
+    const diagProvider = new UnusedVariableDiagnosticProvider();
+    context.subscriptions.push(diagProvider);
 
-  const onChange = vscode.workspace.onDidChangeTextDocument(ev => {
-    if (ev.document.languageId !== '4gl') return;
-    if (!isDiagnosticEnabled()) return;
-    if (diagnosticTimer) clearTimeout(diagnosticTimer);
-    diagnosticTimer = setTimeout(() => diagProvider.updateDiagnostics(ev.document), getDiagnosticDelay());
-  });
-  context.subscriptions.push(onChange);
+    const onChange = vscode.workspace.onDidChangeTextDocument(ev => {
+      if (ev.document.languageId !== '4gl') return;
+      if (!isDiagnosticEnabled()) return;
+      if (diagnosticTimer) clearTimeout(diagnosticTimer);
+      diagnosticTimer = setTimeout(() => diagProvider.updateDiagnostics(ev.document), getDiagnosticDelay());
+    });
+    context.subscriptions.push(onChange);
 
-  const onOpen = vscode.workspace.onDidOpenTextDocument(doc => { if (doc.languageId === '4gl' && isDiagnosticEnabled()) diagProvider.updateDiagnostics(doc); });
-  context.subscriptions.push(onOpen);
+    const onOpen = vscode.workspace.onDidOpenTextDocument(doc => { if (doc.languageId === '4gl' && isDiagnosticEnabled()) diagProvider.updateDiagnostics(doc); });
+    context.subscriptions.push(onOpen);
 
-  const cfgListener = vscode.workspace.onDidChangeConfiguration(ev => {
-    if (ev.affectsConfiguration('GeneroFGL.4gl.diagnostic')) {
-      vscode.workspace.textDocuments.forEach(d => { if (d.languageId === '4gl') { if (isDiagnosticEnabled()) diagProvider.updateDiagnostics(d); else diagProvider.clearDiagnostics(d.uri); } });
-    }
-  });
-  context.subscriptions.push(cfgListener);
+    const cfgListener = vscode.workspace.onDidChangeConfiguration(ev => {
+      if (ev.affectsConfiguration('GeneroFGL.4gl.diagnostic')) {
+        vscode.workspace.textDocuments.forEach(d => { if (d.languageId === '4gl') { if (isDiagnosticEnabled()) diagProvider.updateDiagnostics(d); else diagProvider.clearDiagnostics(d.uri); } });
+      }
+    });
+    context.subscriptions.push(cfgListener);
 
-  // initial run
-  vscode.workspace.textDocuments.forEach(d => { if (d.languageId === '4gl' && isDiagnosticEnabled()) diagProvider.updateDiagnostics(d); });
+    vscode.workspace.textDocuments.forEach(d => { if (d.languageId === '4gl' && isDiagnosticEnabled()) diagProvider.updateDiagnostics(d); });
 
-  context.subscriptions.push(vscode.commands.registerCommand('genero-fgl.runDiagnostics', () => {
-    const ae = vscode.window.activeTextEditor; if (ae && ae.document.languageId === '4gl') { diagProvider.updateDiagnostics(ae.document); vscode.window.showInformationMessage('已运行未使用变量诊断'); } else { vscode.window.showWarningMessage('请打开一个 .4gl 文件'); }
-  }));
+    context.subscriptions.push(vscode.commands.registerCommand('genero-fgl.runDiagnostics', () => {
+      const ae = vscode.window.activeTextEditor; if (ae && ae.document.languageId === '4gl') { diagProvider.updateDiagnostics(ae.document); vscode.window.showInformationMessage('已运行未使用变量诊断'); } else { vscode.window.showWarningMessage('请打开一个 .4gl 文件'); }
+    }));
+  }
 
   console.log('[Genero FGL] activated');
 }
