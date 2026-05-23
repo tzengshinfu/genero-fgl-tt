@@ -20,7 +20,11 @@ import {
   InlayHintKind,
   WorkspaceEdit,
   TextEdit,
-  Range
+  Range,
+  CallHierarchyItem,
+  CallHierarchyIncomingCall,
+  CallHierarchyOutgoingCall,
+  SymbolKind
 } from 'vscode-languageserver/node';
 import { TextDocument } from 'vscode-languageserver-textdocument';
 import * as fs from 'fs';
@@ -54,6 +58,7 @@ connection.onInitialize((params: InitializeParams): InitializeResult => {
       definitionProvider: true,
       inlayHintProvider: true,
       referencesProvider: true,
+      callHierarchyProvider: true,
       renameProvider: {
         prepareProvider: true
       },
@@ -126,6 +131,12 @@ interface FunctionBlock {
   endLine: number;
 }
 
+interface FunctionDefinitionRecord {
+  uri: string;
+  block: FunctionBlock;
+  signature: EnhancedFunctionSignature | null;
+}
+
 interface EnhancedFunctionSignature {
   name: string;
   bracketParameters: string[];
@@ -175,6 +186,15 @@ function extractFunctionBlocks(text: string): FunctionBlock[] {
     }
   }
   return blocks;
+}
+
+function findFunctionBlockAtLine(text: string, line: number): FunctionBlock | null {
+  for (const block of extractFunctionBlocks(text)) {
+    if (line >= block.startLine && line <= block.endLine) {
+      return block;
+    }
+  }
+  return null;
 }
 
 function parseEnhancedFunctionSignature(functionContent: string): EnhancedFunctionSignature | null {
@@ -528,6 +548,20 @@ function findFunctionSignatureInText(text: string, name: string): EnhancedFuncti
   return null;
 }
 
+function findFunctionDefinitionRecordInText(text: string, name: string, uri: string): FunctionDefinitionRecord | null {
+  for (const block of extractFunctionBlocks(text)) {
+    if (block.name.toLowerCase() !== name.toLowerCase()) {
+      continue;
+    }
+    return {
+      uri,
+      block,
+      signature: parseEnhancedFunctionSignature(block.content)
+    };
+  }
+  return null;
+}
+
 async function findFunctionSignature(name: string, currentUri: string, currentText: string): Promise<EnhancedFunctionSignature | null> {
   const local = findFunctionSignatureInText(currentText, name);
   if (local) return local;
@@ -546,6 +580,30 @@ async function findFunctionSignature(name: string, currentUri: string, currentTe
       }
     } catch (error) {
       console.error('[LSP] Error searching signature in', filePath, error);
+    }
+  }
+
+  return null;
+}
+
+async function findFunctionDefinitionRecord(name: string, currentUri: string, currentText: string): Promise<FunctionDefinitionRecord | null> {
+  const local = findFunctionDefinitionRecordInText(currentText, name, currentUri);
+  if (local) return local;
+
+  const currentPath = currentUri.startsWith('file:') ? URI.parse(currentUri).fsPath : currentUri;
+  const seen = new Set<string>([path.normalize(currentPath)]);
+  for (const filePath of collectWorkspaceFiles(['.4gl'])) {
+    const normalized = path.normalize(filePath);
+    if (seen.has(normalized)) continue;
+    seen.add(normalized);
+    try {
+      const text = fs.readFileSync(filePath, 'utf8');
+      const record = findFunctionDefinitionRecordInText(text, name, URI.file(filePath).toString());
+      if (record) {
+        return record;
+      }
+    } catch (error) {
+      console.error('[LSP] Error searching function definition record in', filePath, error);
     }
   }
 
@@ -727,6 +785,116 @@ async function resolveRenameTarget(doc: TextDocument, offset: number): Promise<R
     },
     definitionUri: definition.uri
   };
+}
+
+async function resolveFunctionTarget(doc: TextDocument, offset: number): Promise<RenameTarget | null> {
+  const target = await resolveRenameTarget(doc, offset);
+  if (!target || target.kind !== 'function') {
+    return null;
+  }
+  return target;
+}
+
+function buildFunctionCallHierarchyItem(record: FunctionDefinitionRecord): CallHierarchyItem {
+  const definitionRange = findFunctionDefinitionRangeInText(record.block.content, record.block.name) ?? {
+    start: { line: 0, character: 0 },
+    end: { line: 0, character: record.block.name.length }
+  };
+  const selectionStartLine = record.block.startLine + definitionRange.start.line;
+  const selectionEndLine = record.block.startLine + definitionRange.end.line;
+  const selectionRange: Range = {
+    start: { line: selectionStartLine, character: definitionRange.start.character },
+    end: { line: selectionEndLine, character: definitionRange.end.character }
+  };
+  const range: Range = {
+    start: { line: record.block.startLine, character: 0 },
+    end: { line: record.block.endLine, character: Math.max(0, record.block.content.split(/\r?\n/).slice(-1)[0]?.length ?? 0) }
+  };
+
+  return {
+    name: record.block.name,
+    kind: SymbolKind.Function,
+    uri: record.uri,
+    range,
+    selectionRange,
+    detail: record.signature ? `FUNCTION(${record.signature.allParameters.join(', ')})` : 'FUNCTION'
+  };
+}
+
+function collectFunctionCallLocationsInText(text: string, functionName: string, uri: string): Location[] {
+  const locations: Location[] = [];
+  const escapedName = escapeRegExp(functionName);
+  const lines = text.split(/\r?\n/);
+  const seen = new Set<string>();
+
+  const push = (line: number, start: number, end: number) => {
+    const key = `${line}:${start}:${end}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    locations.push(Location.create(uri, {
+      start: { line, character: start },
+      end: { line, character: end }
+    }));
+  };
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = stripInlineComment(lines[i]);
+    const callRegex = new RegExp(`\\b${escapedName}\\b(?=\\s*\\()`, 'ig');
+    let callMatch: RegExpExecArray | null;
+    while ((callMatch = callRegex.exec(line)) !== null) {
+      push(i, callMatch.index, callMatch.index + callMatch[0].length);
+    }
+
+    const callCommandRegex = new RegExp(`\\bCALL\\s+(${escapedName})\\b`, 'ig');
+    let commandMatch: RegExpExecArray | null;
+    while ((commandMatch = callCommandRegex.exec(line)) !== null) {
+      const start = commandMatch.index + commandMatch[0].length - commandMatch[1].length;
+      push(i, start, start + commandMatch[1].length);
+    }
+  }
+
+  return locations;
+}
+
+function collectCalledFunctionNames(block: FunctionBlock): Array<{ name: string; range: Range }> {
+  const calls: Array<{ name: string; range: Range }> = [];
+  const lines = block.content.split(/\r?\n/);
+  const seen = new Set<string>();
+
+  for (let localLine = 0; localLine < lines.length; localLine++) {
+    const line = stripInlineComment(lines[localLine]);
+
+    const push = (name: string, start: number, end: number) => {
+      if (name.toLowerCase() === block.name.toLowerCase() && block.startLine + localLine === block.startLine) {
+        return;
+      }
+      const key = `${block.startLine + localLine}:${start}:${end}:${name.toLowerCase()}`;
+      if (seen.has(key) || REGEX_PATTERNS.FGL_KEYWORDS.test(name)) return;
+      seen.add(key);
+      calls.push({
+        name,
+        range: {
+          start: { line: block.startLine + localLine, character: start },
+          end: { line: block.startLine + localLine, character: end }
+        }
+      });
+    };
+
+    const callCommandRegex = /\bCALL\s+([A-Za-z_][A-Za-z0-9_]*)\b/ig;
+    let commandMatch: RegExpExecArray | null;
+    while ((commandMatch = callCommandRegex.exec(line)) !== null) {
+      const start = commandMatch.index + commandMatch[0].length - commandMatch[1].length;
+      push(commandMatch[1], start, start + commandMatch[1].length);
+    }
+
+    const parenRegex = /\b([A-Za-z_][A-Za-z0-9_]*)\b(?=\s*\()/ig;
+    let parenMatch: RegExpExecArray | null;
+    while ((parenMatch = parenRegex.exec(line)) !== null) {
+      push(parenMatch[1], parenMatch.index, parenMatch.index + parenMatch[1].length);
+    }
+  }
+
+  return calls;
 }
 
 function collectRenameRangesInText(text: string, target: RenameTarget): Range[] {
@@ -1334,6 +1502,84 @@ connection.onReferences(async (params): Promise<Location[]> => {
   if (!target) return [];
 
   return findReferences(target, doc.uri, doc.getText(), params.context.includeDeclaration === true);
+});
+
+connection.languages.callHierarchy.onPrepare(async (params): Promise<CallHierarchyItem[] | null> => {
+  const doc = documents.get(params.textDocument.uri);
+  if (!doc || doc.languageId !== '4gl') return null;
+
+  const offset = doc.offsetAt(params.position);
+  const target = await resolveFunctionTarget(doc, offset);
+  if (!target) return null;
+
+  const record = await findFunctionDefinitionRecord(target.name, doc.uri, doc.getText());
+  if (!record) return null;
+
+  return [buildFunctionCallHierarchyItem(record)];
+});
+
+connection.languages.callHierarchy.onIncomingCalls(async (params): Promise<CallHierarchyIncomingCall[]> => {
+  const text = readTextByUri(params.item.uri, '', '') ?? readTextByUri(params.item.uri, params.item.uri, documents.get(params.item.uri)?.getText() ?? '');
+  const definitionRecord = text ? findFunctionDefinitionRecordInText(text, params.item.name, params.item.uri) : null;
+  if (!definitionRecord) return [];
+
+  const references = await findReferences({
+    name: definitionRecord.block.name,
+    kind: 'function',
+    range: params.item.selectionRange,
+    definitionUri: params.item.uri
+  }, params.item.uri, text ?? '', false);
+
+  const grouped = new Map<string, CallHierarchyIncomingCall>();
+  for (const reference of references) {
+    const referenceText = readTextByUri(reference.uri, params.item.uri, text ?? '');
+    if (!referenceText) continue;
+    const callerBlock = findFunctionBlockAtLine(referenceText, reference.range.start.line);
+    if (!callerBlock) continue;
+    const callerRecord: FunctionDefinitionRecord = {
+      uri: reference.uri,
+      block: callerBlock,
+      signature: parseEnhancedFunctionSignature(callerBlock.content)
+    };
+    const key = `${reference.uri}:${callerBlock.name}:${callerBlock.startLine}`;
+    const existing = grouped.get(key);
+    if (existing) {
+      existing.fromRanges.push(reference.range);
+      continue;
+    }
+    grouped.set(key, {
+      from: buildFunctionCallHierarchyItem(callerRecord),
+      fromRanges: [reference.range]
+    });
+  }
+
+  return Array.from(grouped.values());
+});
+
+connection.languages.callHierarchy.onOutgoingCalls(async (params): Promise<CallHierarchyOutgoingCall[]> => {
+  const text = readTextByUri(params.item.uri, params.item.uri, documents.get(params.item.uri)?.getText() ?? '');
+  if (!text) return [];
+
+  const definitionRecord = findFunctionDefinitionRecordInText(text, params.item.name, params.item.uri);
+  if (!definitionRecord) return [];
+
+  const grouped = new Map<string, CallHierarchyOutgoingCall>();
+  for (const call of collectCalledFunctionNames(definitionRecord.block)) {
+    const calleeRecord = await findFunctionDefinitionRecord(call.name, params.item.uri, text);
+    if (!calleeRecord) continue;
+    const key = `${calleeRecord.uri}:${calleeRecord.block.name}:${calleeRecord.block.startLine}`;
+    const existing = grouped.get(key);
+    if (existing) {
+      existing.fromRanges.push(call.range);
+      continue;
+    }
+    grouped.set(key, {
+      to: buildFunctionCallHierarchyItem(calleeRecord),
+      fromRanges: [call.range]
+    });
+  }
+
+  return Array.from(grouped.values());
 });
 
 function mapCompletionKind(type?: string): CompletionItemKind {
