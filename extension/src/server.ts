@@ -137,6 +137,12 @@ interface FunctionDefinitionRecord {
   signature: EnhancedFunctionSignature | null;
 }
 
+interface FunctionCallOccurrence {
+  name: string;
+  range: Range;
+  argumentCount: number;
+}
+
 interface EnhancedFunctionSignature {
   name: string;
   bracketParameters: string[];
@@ -420,6 +426,137 @@ function buildUnusedVariableDiagnostics(text: string): Diagnostic[] {
   return diagnostics;
 }
 
+function collectFunctionCallOccurrences(block: FunctionBlock): FunctionCallOccurrence[] {
+  const calls: FunctionCallOccurrence[] = [];
+  const lines = block.content.split(/\r?\n/);
+  const seen = new Set<string>();
+
+  for (let localLine = 0; localLine < lines.length; localLine++) {
+    const line = stripInlineComment(lines[localLine]);
+    const absoluteLine = block.startLine + localLine;
+
+    const push = (name: string, start: number, end: number, argumentCount: number) => {
+      if (REGEX_PATTERNS.FGL_KEYWORDS.test(name)) {
+        return;
+      }
+      const key = `${absoluteLine}:${start}:${end}:${name.toLowerCase()}:${argumentCount}`;
+      if (seen.has(key)) {
+        return;
+      }
+      seen.add(key);
+      calls.push({
+        name,
+        argumentCount,
+        range: {
+          start: { line: absoluteLine, character: start },
+          end: { line: absoluteLine, character: end }
+        }
+      });
+    };
+
+    const callWithArgsRegex = /\bCALL\s+([A-Za-z_][A-Za-z0-9_]*)\s*\((.*)\)/ig;
+    let callWithArgsMatch: RegExpExecArray | null;
+    while ((callWithArgsMatch = callWithArgsRegex.exec(line)) !== null) {
+      const start = callWithArgsMatch.index + callWithArgsMatch[0].length - callWithArgsMatch[1].length - (callWithArgsMatch[2]?.length ?? 0) - 2;
+      push(callWithArgsMatch[1], start, start + callWithArgsMatch[1].length, countArguments(callWithArgsMatch[2] ?? ''));
+    }
+
+    const bareCallRegex = /\bCALL\s+([A-Za-z_][A-Za-z0-9_]*)\b(?!\s*\()/ig;
+    let bareCallMatch: RegExpExecArray | null;
+    while ((bareCallMatch = bareCallRegex.exec(line)) !== null) {
+      const start = bareCallMatch.index + bareCallMatch[0].length - bareCallMatch[1].length;
+      push(bareCallMatch[1], start, start + bareCallMatch[1].length, 0);
+    }
+
+    const parenRegex = /\b([A-Za-z_][A-Za-z0-9_]*)\b\s*\((.*)\)/ig;
+    let parenMatch: RegExpExecArray | null;
+    while ((parenMatch = parenRegex.exec(line)) !== null) {
+      push(parenMatch[1], parenMatch.index, parenMatch.index + parenMatch[1].length, countArguments(parenMatch[2] ?? ''));
+    }
+  }
+
+  return calls;
+}
+
+function countArguments(argumentText: string): number {
+  const trimmed = argumentText.trim();
+  if (!trimmed) {
+    return 0;
+  }
+
+  let count = 1;
+  let depth = 0;
+  let inString = false;
+  for (let i = 0; i < argumentText.length; i++) {
+    const ch = argumentText[i];
+    const previous = i > 0 ? argumentText[i - 1] : '';
+    if (ch === '"' && previous !== '\\') {
+      inString = !inString;
+      continue;
+    }
+    if (inString) {
+      continue;
+    }
+    if (ch === '(') {
+      depth++;
+      continue;
+    }
+    if (ch === ')' && depth > 0) {
+      depth--;
+      continue;
+    }
+    if (ch === ',' && depth === 0) {
+      count++;
+    }
+  }
+  return count;
+}
+
+async function buildSemanticDiagnostics(document: TextDocument): Promise<Diagnostic[]> {
+  const diagnostics: Diagnostic[] = [];
+  const text = document.getText();
+  const signatureCache = new Map<string, Promise<FunctionDefinitionRecord | null>>();
+
+  const resolveFunction = (name: string): Promise<FunctionDefinitionRecord | null> => {
+    const key = name.toLowerCase();
+    let record = signatureCache.get(key);
+    if (!record) {
+      record = findFunctionDefinitionRecord(name, document.uri, text);
+      signatureCache.set(key, record);
+    }
+    return record;
+  };
+
+  for (const block of extractFunctionBlocks(text)) {
+    for (const call of collectFunctionCallOccurrences(block)) {
+      const definition = await resolveFunction(call.name);
+      if (!definition) {
+        diagnostics.push({
+          range: call.range,
+          severity: DiagnosticSeverity.Warning,
+          source: 'Genero FGL',
+          code: 'undefined-function',
+          message: `找不到函式 '${call.name}' 的定義`
+        });
+        continue;
+      }
+
+      const expectedCount = definition.signature?.allParameters.length;
+      if (typeof expectedCount === 'number' && expectedCount !== call.argumentCount) {
+        diagnostics.push({
+          range: call.range,
+          severity: DiagnosticSeverity.Warning,
+          source: 'Genero FGL',
+          code: 'function-arity-mismatch',
+          message: `函式 '${call.name}' 需要 ${expectedCount} 個參數，但目前傳入 ${call.argumentCount} 個`
+        });
+      }
+    }
+  }
+
+  return diagnostics;
+}
+
 async function isDiagnosticEnabled(): Promise<boolean> {
   try {
     const enabled = await connection.workspace.getConfiguration('GeneroFGL.4gl.diagnostic.enable');
@@ -439,7 +576,9 @@ async function validateDocument(document: TextDocument): Promise<void> {
     return;
   }
   try {
-    connection.sendDiagnostics({ uri: document.uri, diagnostics: buildUnusedVariableDiagnostics(document.getText()) });
+    const diagnostics = buildUnusedVariableDiagnostics(document.getText());
+    diagnostics.push(...await buildSemanticDiagnostics(document));
+    connection.sendDiagnostics({ uri: document.uri, diagnostics });
   } catch (error) {
     console.error('[LSP] validateDocument failed', error);
     connection.sendDiagnostics({ uri: document.uri, diagnostics: [] });
