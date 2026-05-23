@@ -53,6 +53,7 @@ connection.onInitialize((params: InitializeParams): InitializeResult => {
       hoverProvider: true,
       definitionProvider: true,
       inlayHintProvider: true,
+      referencesProvider: true,
       renameProvider: {
         prepareProvider: true
       },
@@ -729,6 +730,11 @@ async function resolveRenameTarget(doc: TextDocument, offset: number): Promise<R
 }
 
 function collectRenameRangesInText(text: string, target: RenameTarget): Range[] {
+  return collectReferenceLocationsInText(text, target, 'file:///unused', true).map(location => location.range);
+}
+
+function collectReferenceLocationsInText(text: string, target: RenameTarget, uri: string, includeDeclaration: boolean): Location[] {
+  const locations: Location[] = [];
   const ranges: Range[] = [];
   const seen = new Set<string>();
   const escapedName = escapeRegExp(target.name);
@@ -749,7 +755,7 @@ function collectRenameRangesInText(text: string, target: RenameTarget): Range[] 
 
     if (target.kind === 'function') {
       const defMatch = line.match(REGEX_PATTERNS.FUNCTION);
-      if (defMatch && defMatch[1].toLowerCase() === target.name.toLowerCase()) {
+      if (includeDeclaration && defMatch && defMatch[1].toLowerCase() === target.name.toLowerCase()) {
         const start = line.toLowerCase().indexOf(defMatch[1].toLowerCase());
         if (start >= 0) pushRange(i, start, start + defMatch[1].length);
       }
@@ -770,7 +776,7 @@ function collectRenameRangesInText(text: string, target: RenameTarget): Range[] 
 
     if (target.kind === 'report') {
       const defMatch = line.match(REGEX_PATTERNS.REPORT);
-      if (defMatch && defMatch[1].toLowerCase() === target.name.toLowerCase()) {
+      if (includeDeclaration && defMatch && defMatch[1].toLowerCase() === target.name.toLowerCase()) {
         const start = line.toLowerCase().indexOf(defMatch[1].toLowerCase());
         if (start >= 0) pushRange(i, start, start + defMatch[1].length);
       }
@@ -784,7 +790,33 @@ function collectRenameRangesInText(text: string, target: RenameTarget): Range[] 
     }
   }
 
-  return ranges;
+  for (const range of ranges) {
+    locations.push(Location.create(uri, range));
+  }
+
+  return locations;
+}
+
+async function findReferences(target: RenameTarget, currentUri: string, currentText: string, includeDeclaration: boolean): Promise<Location[]> {
+  const references: Location[] = [];
+  const currentPath = currentUri.startsWith('file:') ? URI.parse(currentUri).fsPath : currentUri;
+  const seen = new Set<string>([path.normalize(currentPath)]);
+
+  references.push(...collectReferenceLocationsInText(currentText, target, currentUri, includeDeclaration));
+
+  for (const filePath of collectWorkspaceFiles(['.4gl'])) {
+    const normalized = path.normalize(filePath);
+    if (seen.has(normalized)) continue;
+    seen.add(normalized);
+    try {
+      const text = fs.readFileSync(filePath, 'utf8');
+      references.push(...collectReferenceLocationsInText(text, target, URI.file(filePath).toString(), includeDeclaration));
+    } catch (error) {
+      console.error('[LSP] Error searching references in', filePath, error);
+    }
+  }
+
+  return references;
 }
 
 function buildRenameWorkspaceEdit(target: RenameTarget, newName: string, currentUri: string, currentText: string): WorkspaceEdit {
@@ -1291,6 +1323,17 @@ connection.onRenameRequest(async (params): Promise<WorkspaceEdit | null> => {
   }
 
   return buildRenameWorkspaceEdit(target, params.newName, doc.uri, doc.getText());
+});
+
+connection.onReferences(async (params): Promise<Location[]> => {
+  const doc = documents.get(params.textDocument.uri);
+  if (!doc || doc.languageId !== '4gl') return [];
+
+  const offset = doc.offsetAt(params.position);
+  const target = await resolveRenameTarget(doc, offset);
+  if (!target) return [];
+
+  return findReferences(target, doc.uri, doc.getText(), params.context.includeDeclaration === true);
 });
 
 function mapCompletionKind(type?: string): CompletionItemKind {
