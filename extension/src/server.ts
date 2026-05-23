@@ -12,7 +12,10 @@ import {
   Location,
   Diagnostic,
   DiagnosticSeverity,
-  DiagnosticTag
+  DiagnosticTag,
+  SignatureHelp,
+  SignatureInformation,
+  ParameterInformation
 } from 'vscode-languageserver/node';
 import { TextDocument } from 'vscode-languageserver-textdocument';
 import * as fs from 'fs';
@@ -44,6 +47,10 @@ connection.onInitialize((params: InitializeParams): InitializeResult => {
       textDocumentSync: TextDocumentSyncKind.Incremental,
       hoverProvider: true,
       definitionProvider: true,
+      signatureHelpProvider: {
+        triggerCharacters: ['(', ','],
+        retriggerCharacters: [',']
+      },
       completionProvider: {
         resolveProvider: false,
         triggerCharacters: 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_'.split('')
@@ -498,6 +505,109 @@ async function findDefinition(name: string, currentUri: string, currentText: str
   return null;
 }
 
+function findFunctionSignatureInText(text: string, name: string): EnhancedFunctionSignature | null {
+  for (const block of extractFunctionBlocks(text)) {
+    if (block.name.toLowerCase() !== name.toLowerCase()) {
+      continue;
+    }
+    const signature = parseEnhancedFunctionSignature(block.content);
+    if (signature) {
+      return signature;
+    }
+  }
+  return null;
+}
+
+async function findFunctionSignature(name: string, currentUri: string, currentText: string): Promise<EnhancedFunctionSignature | null> {
+  const local = findFunctionSignatureInText(currentText, name);
+  if (local) return local;
+
+  const currentPath = currentUri.startsWith('file:') ? URI.parse(currentUri).fsPath : currentUri;
+  const seen = new Set<string>([path.normalize(currentPath)]);
+  for (const filePath of collectWorkspaceFiles(['.4gl'])) {
+    const normalized = path.normalize(filePath);
+    if (seen.has(normalized)) continue;
+    seen.add(normalized);
+    try {
+      const text = fs.readFileSync(filePath, 'utf8');
+      const signature = findFunctionSignatureInText(text, name);
+      if (signature) {
+        return signature;
+      }
+    } catch (error) {
+      console.error('[LSP] Error searching signature in', filePath, error);
+    }
+  }
+
+  return null;
+}
+
+interface CallContext {
+  functionName: string;
+  activeParameter: number;
+}
+
+function getCallContext(text: string, offset: number): CallContext | null {
+  if (offset < 0 || offset > text.length) return null;
+
+  let depth = 0;
+  let activeParameter = 0;
+  let openParenIndex = -1;
+
+  for (let index = offset - 1; index >= 0; index--) {
+    const ch = text[index];
+    if (ch === ')') {
+      depth++;
+      continue;
+    }
+    if (ch === '(') {
+      if (depth === 0) {
+        openParenIndex = index;
+        break;
+      }
+      depth--;
+      continue;
+    }
+    if (ch === ',' && depth === 0) {
+      activeParameter++;
+    }
+  }
+
+  if (openParenIndex === -1) return null;
+
+  let nameEnd = openParenIndex - 1;
+  while (nameEnd >= 0 && /\s/.test(text[nameEnd])) {
+    nameEnd--;
+  }
+  if (nameEnd < 0) return null;
+
+  let nameStart = nameEnd;
+  while (nameStart >= 0 && /[A-Za-z0-9_]/.test(text[nameStart])) {
+    nameStart--;
+  }
+  nameStart++;
+
+  const functionName = text.substring(nameStart, nameEnd + 1);
+  if (!functionName) return null;
+
+  return {
+    functionName,
+    activeParameter
+  };
+}
+
+function buildSignatureHelp(signature: EnhancedFunctionSignature, activeParameter: number): SignatureHelp {
+  const parameters = signature.allParameters.map(parameterName => ParameterInformation.create(parameterName));
+  const label = `${signature.name}(${signature.allParameters.join(', ')})`;
+  const safeActiveParameter = Math.max(0, Math.min(activeParameter, Math.max(parameters.length - 1, 0)));
+
+  return {
+    signatures: [SignatureInformation.create(label, undefined, ...parameters)],
+    activeSignature: 0,
+    activeParameter: parameters.length > 0 ? safeActiveParameter : 0
+  };
+}
+
 function getWordAtPosition(text: string, offset: number): { word: string; start: number; end: number } {
   let start = offset;
   let end = offset;
@@ -801,6 +911,20 @@ connection.onDefinition(async (params): Promise<Location | null> => {
   const { word } = getWordAtPosition(doc.getText(), offset);
   if (!word) return null;
   return findDefinition(word, doc.uri, doc.getText());
+});
+
+connection.onSignatureHelp(async (params): Promise<SignatureHelp | null> => {
+  const doc = documents.get(params.textDocument.uri);
+  if (!doc || doc.languageId !== '4gl') return null;
+
+  const offset = doc.offsetAt(params.position);
+  const callContext = getCallContext(doc.getText(), offset);
+  if (!callContext) return null;
+
+  const signature = await findFunctionSignature(callContext.functionName, doc.uri, doc.getText());
+  if (!signature) return null;
+
+  return buildSignatureHelp(signature, callContext.activeParameter);
 });
 
 function mapCompletionKind(type?: string): CompletionItemKind {
