@@ -15,7 +15,9 @@ import {
   DiagnosticTag,
   SignatureHelp,
   SignatureInformation,
-  ParameterInformation
+  ParameterInformation,
+  InlayHint,
+  InlayHintKind
 } from 'vscode-languageserver/node';
 import { TextDocument } from 'vscode-languageserver-textdocument';
 import * as fs from 'fs';
@@ -47,6 +49,7 @@ connection.onInitialize((params: InitializeParams): InitializeResult => {
       textDocumentSync: TextDocumentSyncKind.Incremental,
       hoverProvider: true,
       definitionProvider: true,
+      inlayHintProvider: true,
       signatureHelpProvider: {
         triggerCharacters: ['(', ','],
         retriggerCharacters: [',']
@@ -608,6 +611,133 @@ function buildSignatureHelp(signature: EnhancedFunctionSignature, activeParamete
   };
 }
 
+interface CallSite {
+  functionName: string;
+  argumentOffsets: number[];
+}
+
+function collectCallSitesInRange(text: string, startOffset: number, endOffset: number): CallSite[] {
+  const callSites: CallSite[] = [];
+  let index = Math.max(0, startOffset);
+
+  while (index < Math.min(endOffset, text.length)) {
+    const ch = text[index];
+    if (ch !== '(') {
+      index++;
+      continue;
+    }
+
+    let nameEnd = index - 1;
+    while (nameEnd >= startOffset && /\s/.test(text[nameEnd])) {
+      nameEnd--;
+    }
+    if (nameEnd < startOffset) {
+      index++;
+      continue;
+    }
+
+    let nameStart = nameEnd;
+    while (nameStart >= startOffset && /[A-Za-z0-9_]/.test(text[nameStart])) {
+      nameStart--;
+    }
+    nameStart++;
+
+    const functionName = text.substring(nameStart, nameEnd + 1);
+    if (!functionName || REGEX_PATTERNS.FGL_KEYWORDS.test(functionName)) {
+      index++;
+      continue;
+    }
+
+    const argumentOffsets: number[] = [];
+    let cursor = index + 1;
+    let depth = 1;
+    let inString = false;
+    let hasCurrentArgument = false;
+
+    while (cursor < text.length && depth > 0) {
+      const current = text[cursor];
+      const previous = cursor > 0 ? text[cursor - 1] : '';
+
+      if (current === '"' && previous !== '\\') {
+        inString = !inString;
+        cursor++;
+        continue;
+      }
+
+      if (inString) {
+        cursor++;
+        continue;
+      }
+
+      if (current === '(') {
+        depth++;
+        cursor++;
+        continue;
+      }
+
+      if (current === ')') {
+        depth--;
+        if (depth === 0) {
+          break;
+        }
+        cursor++;
+        continue;
+      }
+
+      if (depth === 1 && current === ',') {
+        hasCurrentArgument = false;
+        cursor++;
+        continue;
+      }
+
+      if (depth === 1 && !hasCurrentArgument && !/\s/.test(current)) {
+        argumentOffsets.push(cursor);
+        hasCurrentArgument = true;
+      }
+
+      cursor++;
+    }
+
+    callSites.push({ functionName, argumentOffsets });
+    index = cursor + 1;
+  }
+
+  return callSites;
+}
+
+async function buildInlayHintsForRange(doc: TextDocument, startOffset: number, endOffset: number): Promise<InlayHint[]> {
+  const hints: InlayHint[] = [];
+  const text = doc.getText();
+  const callSites = collectCallSitesInRange(text, startOffset, endOffset);
+  const signatureCache = new Map<string, Promise<EnhancedFunctionSignature | null>>();
+
+  for (const callSite of callSites) {
+    const key = callSite.functionName.toLowerCase();
+    let signaturePromise = signatureCache.get(key);
+    if (!signaturePromise) {
+      signaturePromise = findFunctionSignature(callSite.functionName, doc.uri, text);
+      signatureCache.set(key, signaturePromise);
+    }
+
+    const signature = await signaturePromise;
+    if (!signature || signature.allParameters.length === 0) {
+      continue;
+    }
+
+    const count = Math.min(callSite.argumentOffsets.length, signature.allParameters.length);
+    for (let i = 0; i < count; i++) {
+      hints.push({
+        position: doc.positionAt(callSite.argumentOffsets[i]),
+        label: `${signature.allParameters[i]}: `,
+        kind: InlayHintKind.Parameter,
+        paddingRight: true
+      });
+    }
+  }
+
+  return hints;
+}
+
 function getWordAtPosition(text: string, offset: number): { word: string; start: number; end: number } {
   let start = offset;
   let end = offset;
@@ -925,6 +1055,15 @@ connection.onSignatureHelp(async (params): Promise<SignatureHelp | null> => {
   if (!signature) return null;
 
   return buildSignatureHelp(signature, callContext.activeParameter);
+});
+
+connection.languages.inlayHint.on(async (params): Promise<InlayHint[]> => {
+  const doc = documents.get(params.textDocument.uri);
+  if (!doc || doc.languageId !== '4gl') return [];
+
+  const startOffset = doc.offsetAt(params.range.start);
+  const endOffset = doc.offsetAt(params.range.end);
+  return buildInlayHintsForRange(doc, startOffset, endOffset);
 });
 
 function mapCompletionKind(type?: string): CompletionItemKind {
