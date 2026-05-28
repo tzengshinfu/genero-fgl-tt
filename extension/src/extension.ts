@@ -601,6 +601,9 @@ export function activate(context: vscode.ExtensionContext) {
           documentSelector: [{ language: '4gl' }, { language: 'per' }],
           outputChannel: languageServerOutputChannel,
           synchronize: { configurationSection: 'GeneroFGL' },
+          initializationOptions: {
+            cacheDir: context.globalStorageUri.fsPath
+          },
           middleware: {
             provideCompletionItem: async (document, position, completionContext, token, next) => {
               logInfo('[Client] provideCompletionItem middleware called for', document.uri.toString(), 'at', position);

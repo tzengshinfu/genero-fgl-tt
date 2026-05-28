@@ -61,6 +61,9 @@ let workspaceFunctionCacheInitialized = false;
 let libraryPathsList: string[] = [];
 const libraryFunctionRecordsByUri = new Map<string, FunctionDefinitionRecord[]>();
 let libraryFunctionCacheInitialized = false;
+let cacheDir = '';
+let diskCacheLoaded = false;
+let diskCacheEntries: Record<string, LibraryCacheEntry> = {};
 const DIAGNOSTIC_DEBOUNCE_MS = 2500;
 const SEMANTIC_TOKENS_REFRESH_DEBOUNCE_MS = 80;
 const SEMANTIC_TOKEN_TYPES = ['function', 'parameter', 'variable', 'type', 'keyword'] as const;
@@ -86,6 +89,10 @@ connection.onInitialize((params: InitializeParams): InitializeResult => {
   }
   if (workspaceFolders.size === 0 && params.rootUri?.startsWith('file:')) {
     workspaceFolders.add(URI.parse(params.rootUri).fsPath);
+  }
+  if (typeof params.initializationOptions?.cacheDir === 'string' && params.initializationOptions.cacheDir) {
+    cacheDir = params.initializationOptions.cacheDir;
+    logInfo('[LSP Server] cache directory:', cacheDir);
   }
   return {
     capabilities: {
@@ -252,6 +259,19 @@ interface FunctionDefinitionRecord {
   block: FunctionBlock;
   signature: EnhancedFunctionSignature | null;
 }
+
+interface LibraryCacheEntry {
+  mtime: number;
+  size: number;
+  records: FunctionDefinitionRecord[];
+}
+
+interface LibraryDiskCache {
+  version: number;
+  entries: Record<string, LibraryCacheEntry>;
+}
+
+const CACHE_VERSION = 1;
 
 interface FunctionCallOccurrence {
   name: string;
@@ -801,27 +821,92 @@ function ensureWorkspaceFunctionCache(): void {
   workspaceFunctionCacheInitialized = true;
 }
 
+function loadDiskCache(): void {
+  if (!cacheDir || diskCacheLoaded) return;
+  diskCacheLoaded = true;
+  const cacheFile = path.join(cacheDir, 'fgl-library-cache.json');
+  try {
+    if (!fs.existsSync(cacheFile)) {
+      logInfo('[LSP] No disk cache found at', cacheFile);
+      return;
+    }
+    const raw = fs.readFileSync(cacheFile, 'utf8');
+    const parsed = JSON.parse(raw) as LibraryDiskCache;
+    if (parsed.version === CACHE_VERSION && parsed.entries && typeof parsed.entries === 'object') {
+      diskCacheEntries = parsed.entries;
+      logInfo('[LSP] Loaded disk cache:', Object.keys(diskCacheEntries).length, 'entries from', cacheFile);
+    } else {
+      logWarn('[LSP] Disk cache version mismatch or invalid, ignoring');
+      diskCacheEntries = {};
+    }
+  } catch (error) {
+    logWarn('[LSP] Failed to load disk cache:', String(error));
+    diskCacheEntries = {};
+  }
+}
+
+function saveDiskCacheAsync(): void {
+  if (!cacheDir) return;
+  const cacheFile = path.join(cacheDir, 'fgl-library-cache.json');
+  const data: LibraryDiskCache = { version: CACHE_VERSION, entries: diskCacheEntries };
+  try {
+    fs.mkdirSync(cacheDir, { recursive: true });
+  } catch { /* ignore */ }
+  fs.writeFile(cacheFile, JSON.stringify(data), 'utf8', (err) => {
+    if (err) logWarn('[LSP] Failed to save disk cache:', String(err));
+    else logInfo('[LSP] Disk cache saved:', Object.keys(diskCacheEntries).length, 'entries to', cacheFile);
+  });
+}
+
 function ensureLibraryFunctionCache(): void {
   if (libraryFunctionCacheInitialized) return;
+  loadDiskCache();
   logInfo('[LSP] Building library function cache...');
   let totalFunctions = 0;
+  let cacheHits = 0;
+  let cacheMisses = 0;
+  let cacheUpdated = false;
   const allFiles = collectLibraryFiles(['.4gl']);
   logInfo('[LSP] Library files to index:', allFiles.length);
   for (const filePath of allFiles) {
     const uri = URI.file(filePath).toString();
     if (libraryFunctionRecordsByUri.has(uri)) continue;
+
+    let stat: fs.Stats | undefined;
+    try {
+      stat = fs.statSync(filePath);
+    } catch {
+      logWarn('[LSP] Cannot stat file:', filePath);
+      continue;
+    }
+
+    const cached = diskCacheEntries[filePath];
+    if (cached && cached.mtime === stat.mtimeMs && cached.size === stat.size) {
+      libraryFunctionRecordsByUri.set(uri, cached.records);
+      logInfo(`[LSP]   [hit] ${cached.records.length} function(s): ${path.basename(filePath)}`);
+      totalFunctions += cached.records.length;
+      cacheHits++;
+      continue;
+    }
+
     try {
       const text = fs.readFileSync(filePath, 'utf8');
       const records = collectFunctionDefinitionRecordsFromText(text, uri);
       libraryFunctionRecordsByUri.set(uri, records);
-      logInfo(`[LSP]   indexed ${records.length} function(s): ${filePath}`);
+      diskCacheEntries[filePath] = { mtime: stat.mtimeMs, size: stat.size, records };
+      cacheUpdated = true;
+      logInfo(`[LSP]   [miss] indexed ${records.length} function(s): ${path.basename(filePath)}`);
       totalFunctions += records.length;
+      cacheMisses++;
     } catch (error) {
       logError('[LSP] Error building library function cache for', filePath, error);
     }
   }
   libraryFunctionCacheInitialized = true;
-  logInfo(`[LSP] Library cache ready: ${allFiles.length} file(s), ${totalFunctions} function(s) total`);
+  logInfo(`[LSP] Library cache ready: ${allFiles.length} file(s), ${totalFunctions} function(s) total (hits=${cacheHits}, misses=${cacheMisses})`);
+  if (cacheUpdated) {
+    saveDiskCacheAsync();
+  }
 }
 
 async function refreshLibraryPathsAndCache(): Promise<void> {
