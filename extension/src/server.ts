@@ -1137,8 +1137,11 @@ async function validateSemanticDiagnostics(document: TextDocument): Promise<void
     return;
   }
 
+  logInfo('[LSP] Step7 validateSemanticDiagnostics:', path.basename(document.uri));
   try {
-    updateDiagnosticBucket(document.uri, 'semantic', await buildSemanticDiagnostics(document));
+    const diagnostics = await buildSemanticDiagnostics(document);
+    logInfo('[LSP] Step7 validateSemanticDiagnostics:', path.basename(document.uri), '->', diagnostics.length, 'issue(s)');
+    updateDiagnosticBucket(document.uri, 'semantic', diagnostics);
   } catch (error) {
     logError('[LSP] validateSemanticDiagnostics failed', error);
     updateDiagnosticBucket(document.uri, 'semantic', []);
@@ -2282,13 +2285,20 @@ connection.onSignatureHelp(async (params): Promise<SignatureHelp | null> => {
   const doc = documents.get(params.textDocument.uri);
   if (!doc || doc.languageId !== '4gl') return null;
 
+  logInfo('[LSP] Step2 onSignatureHelp:', path.basename(doc.uri), 'line:', params.position.line);
   const offset = doc.offsetAt(params.position);
   const callContext = getCallContext(doc.getText(), offset);
-  if (!callContext) return null;
-
+  if (!callContext) {
+    logInfo('[LSP] Step2 onSignatureHelp: no call context at cursor');
+    return null;
+  }
+  logInfo('[LSP] Step2 onSignatureHelp: resolving signature for', callContext.functionName);
   const signature = await findFunctionSignature(callContext.functionName, doc.uri, doc.getText());
-  if (!signature) return null;
-
+  if (!signature) {
+    logInfo('[LSP] Step2 onSignatureHelp: signature not found for', callContext.functionName);
+    return null;
+  }
+  logInfo('[LSP] Step2 onSignatureHelp: found signature for', callContext.functionName, 'params:', signature.allParameters?.length ?? 0);
   return buildSignatureHelp(signature, callContext.activeParameter);
 });
 
@@ -2296,17 +2306,22 @@ connection.languages.inlayHint.on(async (params): Promise<InlayHint[]> => {
   const doc = documents.get(params.textDocument.uri);
   if (!doc || doc.languageId !== '4gl') return [];
 
+  logInfo('[LSP] Step3 inlayHint:', path.basename(doc.uri), 'lines:', params.range.start.line, '-', params.range.end.line);
   const startOffset = doc.offsetAt(params.range.start);
   const endOffset = doc.offsetAt(params.range.end);
-  return buildInlayHintsForRange(doc, startOffset, endOffset);
+  const hints = await buildInlayHintsForRange(doc, startOffset, endOffset);
+  logInfo('[LSP] Step3 inlayHint: returned', hints.length, 'hint(s)');
+  return hints;
 });
 
 connection.onPrepareRename(async (params): Promise<Range | null> => {
   const doc = documents.get(params.textDocument.uri);
   if (!doc || doc.languageId !== '4gl') return null;
 
+  logInfo('[LSP] Step4 onPrepareRename:', path.basename(doc.uri), 'line:', params.position.line);
   const offset = doc.offsetAt(params.position);
   const target = await resolveRenameTarget(doc, offset);
+  logInfo('[LSP] Step4 onPrepareRename: target', target ? `"${target.name}" (${target.kind})` : 'not found');
   return target?.range ?? null;
 });
 
@@ -2316,23 +2331,35 @@ connection.onRenameRequest(async (params): Promise<WorkspaceEdit | null> => {
 
   const offset = doc.offsetAt(params.position);
   const target = await resolveRenameTarget(doc, offset);
-  if (!target) return null;
+  if (!target) {
+    logInfo('[LSP] Step4 onRenameRequest: target not found');
+    return null;
+  }
+  logInfo('[LSP] Step4 onRenameRequest:', path.basename(doc.uri), `"${target.name}" -> "${params.newName}"`);
   if (!params.newName || !/^[A-Za-z_][A-Za-z0-9_]*$/u.test(params.newName)) {
+    logInfo('[LSP] Step4 onRenameRequest: invalid new name');
     return null;
   }
 
-  return buildRenameWorkspaceEdit(target, params.newName, doc.uri, doc.getText());
+  const renameEdit = buildRenameWorkspaceEdit(target, params.newName, doc.uri, doc.getText());
+  logInfo('[LSP] Step4 onRenameRequest: edit affects', Object.keys(renameEdit.changes ?? {}).length, 'file(s)');
+  return renameEdit;
 });
 
 connection.onReferences(async (params): Promise<Location[]> => {
   const doc = documents.get(params.textDocument.uri);
   if (!doc || doc.languageId !== '4gl') return [];
 
+  logInfo('[LSP] Step5 onReferences:', path.basename(doc.uri), 'line:', params.position.line);
   const offset = doc.offsetAt(params.position);
   const target = await resolveRenameTarget(doc, offset);
-  if (!target) return [];
-
-  return findReferences(target, doc.uri, doc.getText(), params.context.includeDeclaration === true);
+  if (!target) {
+    logInfo('[LSP] Step5 onReferences: target not found');
+    return [];
+  }
+  const refs = await findReferences(target, doc.uri, doc.getText(), params.context.includeDeclaration === true);
+  logInfo('[LSP] Step5 onReferences:', `"${target.name}" ->`, refs.length, 'reference(s)');
+  return refs;
 });
 
 connection.languages.semanticTokens.on((params): SemanticTokens => {
@@ -2340,27 +2367,42 @@ connection.languages.semanticTokens.on((params): SemanticTokens => {
   if (!doc || doc.languageId !== '4gl') {
     return { data: [] };
   }
-  return buildSemanticTokens(doc.getText());
+  logInfo('[LSP] Step8 semanticTokens:', path.basename(doc.uri));
+  const tokens = buildSemanticTokens(doc.getText());
+  logInfo('[LSP] Step8 semanticTokens: returned', (tokens.data.length / 5) | 0, 'token(s)');
+  return tokens;
 });
 
 connection.languages.callHierarchy.onPrepare(async (params): Promise<CallHierarchyItem[] | null> => {
   const doc = documents.get(params.textDocument.uri);
   if (!doc || doc.languageId !== '4gl') return null;
 
+  logInfo('[LSP] Step6 callHierarchy.onPrepare:', path.basename(doc.uri), 'line:', params.position.line);
   const offset = doc.offsetAt(params.position);
   const target = await resolveFunctionTarget(doc, offset);
-  if (!target) return null;
+  if (!target) {
+    logInfo('[LSP] Step6 callHierarchy.onPrepare: target not found');
+    return null;
+  }
 
   const record = await findFunctionDefinitionRecord(target.name, doc.uri, doc.getText());
-  if (!record) return null;
+  if (!record) {
+    logInfo('[LSP] Step6 callHierarchy.onPrepare: definition not found for', target.name);
+    return null;
+  }
 
+  logInfo('[LSP] Step6 callHierarchy.onPrepare: resolved', `"${target.name}"`);
   return [buildFunctionCallHierarchyItem(record)];
 });
 
 connection.languages.callHierarchy.onIncomingCalls(async (params): Promise<CallHierarchyIncomingCall[]> => {
+  logInfo('[LSP] Step6 callHierarchy.onIncomingCalls:', `"${params.item.name}"`);
   const text = readTextByUri(params.item.uri, '', '') ?? readTextByUri(params.item.uri, params.item.uri, documents.get(params.item.uri)?.getText() ?? '');
   const definitionRecord = text ? findFunctionDefinitionRecordInText(text, params.item.name, params.item.uri) : null;
-  if (!definitionRecord) return [];
+  if (!definitionRecord) {
+    logInfo('[LSP] Step6 callHierarchy.onIncomingCalls: definition not found for', params.item.name);
+    return [];
+  }
 
   const references = await findReferences({
     name: definitionRecord.block.name,
@@ -2392,15 +2434,24 @@ connection.languages.callHierarchy.onIncomingCalls(async (params): Promise<CallH
     });
   }
 
-  return Array.from(grouped.values());
+  const incomingResult = Array.from(grouped.values());
+  logInfo('[LSP] Step6 callHierarchy.onIncomingCalls:', `"${params.item.name}" ->`, incomingResult.length, 'caller(s)');
+  return incomingResult;
 });
 
 connection.languages.callHierarchy.onOutgoingCalls(async (params): Promise<CallHierarchyOutgoingCall[]> => {
+  logInfo('[LSP] Step6 callHierarchy.onOutgoingCalls:', `"${params.item.name}"`);
   const text = readTextByUri(params.item.uri, params.item.uri, documents.get(params.item.uri)?.getText() ?? '');
-  if (!text) return [];
+  if (!text) {
+    logInfo('[LSP] Step6 callHierarchy.onOutgoingCalls: cannot read text for', params.item.name);
+    return [];
+  }
 
   const definitionRecord = findFunctionDefinitionRecordInText(text, params.item.name, params.item.uri);
-  if (!definitionRecord) return [];
+  if (!definitionRecord) {
+    logInfo('[LSP] Step6 callHierarchy.onOutgoingCalls: definition not found for', params.item.name);
+    return [];
+  }
 
   const grouped = new Map<string, CallHierarchyOutgoingCall>();
   for (const call of collectCalledFunctionNames(definitionRecord.block)) {
@@ -2418,7 +2469,9 @@ connection.languages.callHierarchy.onOutgoingCalls(async (params): Promise<CallH
     });
   }
 
-  return Array.from(grouped.values());
+  const outgoingResult = Array.from(grouped.values());
+  logInfo('[LSP] Step6 callHierarchy.onOutgoingCalls:', `"${params.item.name}" ->`, outgoingResult.length, 'callee(s)');
+  return outgoingResult;
 });
 
 function mapCompletionKind(type?: string): CompletionItemKind {
