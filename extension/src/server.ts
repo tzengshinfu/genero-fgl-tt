@@ -803,17 +803,25 @@ function ensureWorkspaceFunctionCache(): void {
 
 function ensureLibraryFunctionCache(): void {
   if (libraryFunctionCacheInitialized) return;
-  for (const filePath of collectLibraryFiles(['.4gl'])) {
+  logInfo('[LSP] Building library function cache...');
+  let totalFunctions = 0;
+  const allFiles = collectLibraryFiles(['.4gl']);
+  logInfo('[LSP] Library files to index:', allFiles.length);
+  for (const filePath of allFiles) {
     const uri = URI.file(filePath).toString();
     if (libraryFunctionRecordsByUri.has(uri)) continue;
     try {
       const text = fs.readFileSync(filePath, 'utf8');
-      libraryFunctionRecordsByUri.set(uri, collectFunctionDefinitionRecordsFromText(text, uri));
+      const records = collectFunctionDefinitionRecordsFromText(text, uri);
+      libraryFunctionRecordsByUri.set(uri, records);
+      logInfo(`[LSP]   indexed ${records.length} function(s): ${filePath}`);
+      totalFunctions += records.length;
     } catch (error) {
       logError('[LSP] Error building library function cache for', filePath, error);
     }
   }
   libraryFunctionCacheInitialized = true;
+  logInfo(`[LSP] Library cache ready: ${allFiles.length} file(s), ${totalFunctions} function(s) total`);
 }
 
 async function refreshLibraryPathsAndCache(): Promise<void> {
@@ -825,10 +833,18 @@ async function refreshLibraryPathsAndCache(): Promise<void> {
   } catch {
     libraryPathsList = [];
   }
+  logInfo('[LSP] Library paths config:', libraryPathsList.length, 'pattern(s)');
+  for (const p of libraryPathsList) {
+    logInfo('[LSP]   pattern:', p);
+  }
+  const wsRoots = Array.from(workspaceFolders);
+  logInfo('[LSP] Workspace roots:', wsRoots.length, 'folder(s)');
+  for (const r of wsRoots) {
+    logInfo('[LSP]   root:', r);
+  }
   libraryFunctionRecordsByUri.clear();
   libraryFunctionCacheInitialized = false;
   ensureLibraryFunctionCache();
-  logInfo('[LSP Server] Library paths refreshed, count:', libraryPathsList.length);
 }
 
 function updateFunctionDefinitionCache(document: TextDocument): void {
@@ -1208,7 +1224,10 @@ function collectLibraryFilesFromPattern(globPattern: string, out: string[]): voi
     ? [normalized]
     : Array.from(workspaceFolders).map(wsRoot => path.join(wsRoot, normalized));
 
+  logInfo(`[LSP]   pattern "${globPattern}" -> ${pathsToTry.length} resolved path(s):`);
+
   for (const resolvedPattern of pathsToTry) {
+    logInfo(`[LSP]     resolved: ${resolvedPattern}`);
     const dir = path.dirname(resolvedPattern);
     const filePattern = path.basename(resolvedPattern);
 
@@ -1217,10 +1236,15 @@ function collectLibraryFilesFromPattern(globPattern: string, out: string[]): voi
         if (fs.existsSync(resolvedPattern)) {
           const stat = fs.statSync(resolvedPattern);
           if (stat.isDirectory()) {
+            const before = out.length;
             collectFilesRecursive(resolvedPattern, ['.4gl'], out);
+            logInfo(`[LSP]     (directory) matched ${out.length - before} file(s)`);
           } else {
             out.push(resolvedPattern);
+            logInfo(`[LSP]     (file) matched`);
           }
+        } else {
+          logWarn(`[LSP]     path not found: ${resolvedPattern}`);
         }
       } catch {
         // skip inaccessible paths
@@ -1232,13 +1256,16 @@ function collectLibraryFilesFromPattern(globPattern: string, out: string[]): voi
     try {
       entries = fs.readdirSync(dir, { withFileTypes: true });
     } catch {
+      logWarn(`[LSP]     cannot read directory: ${dir}`);
       continue;
     }
+    const before = out.length;
     for (const entry of entries) {
       if (entry.isFile() && matchGlobPattern(entry.name, filePattern)) {
         out.push(path.join(dir, entry.name));
       }
     }
+    logInfo(`[LSP]     (glob) matched ${out.length - before} file(s) in ${dir}`);
   }
 }
 
