@@ -8,6 +8,9 @@
             "include": "#comments"
         },
         {
+            "include": "#globals-blocks"
+        },
+        {
             "include": "#type-record-structures"
         },
         {
@@ -61,6 +64,42 @@
         }
     ],
     "repository": {
+        "globals-blocks": {
+            "patterns": [
+                {
+                    "begin": "(?i:^\\s*(GLOBALS)\\b)",
+                    "beginCaptures": {
+                        "1": {
+                            "name": "keyword.control.4gl"
+                        }
+                    },
+                    "end": "(?i:^\\s*(END)\\s+(GLOBALS)\\b)",
+                    "endCaptures": {
+                        "1": {
+                            "name": "keyword.control.4gl"
+                        },
+                        "2": {
+                            "name": "keyword.control.4gl"
+                        }
+                    },
+                    "name": "meta.globals.4gl",
+                    "patterns": [
+                        {
+                            "include": "#comments"
+                        },
+                        {
+                            "include": "#strings"
+                        },
+                        {
+                            "include": "#numerics"
+                        },
+                        {
+                            "include": "#keywords"
+                        }
+                    ]
+                }
+            ]
+        },
         "type-record-structures": {
             "patterns": [
                 {
@@ -156,15 +195,8 @@
                     "name": "comment.line.double-dash.4gl"
                 },
                 {
-                    "match": "\\{[^}]*\\}",
-                    "name": "comment.block.4gl"
-                },
-                {
-                    "match": "\\{.*$",
-                    "name": "comment.block.4gl"
-                },
-                {
-                    "match": "^\\s*\\}",
+                    "begin": "\\{",
+                    "end": "\\}",
                     "name": "comment.block.4gl"
                 }
             ]

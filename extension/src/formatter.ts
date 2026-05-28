@@ -1,5 +1,7 @@
 // TypeScript version of the simple formatter utilities.
 
+import { logInfo } from './utils/logger';
+
 export type Part = { type: 'code' | 'string' | 'comment', text: string };
 
 // Keywords used for uppercasing; stored in a Set for faster lookup.
@@ -102,7 +104,7 @@ export function uppercaseKeywordsInCode(code: string): string {
 export function splitDefineLines(text: string): string {
   // Deprecated: kept for API compatibility. Previously split DEFINE lines,
   // now a no-op to avoid surprising transformations.
-  if (process.env.FGL_FMT_DEBUG) console.log('splitDefineLines: removed (no-op)');
+  if (process.env.FGL_FMT_DEBUG) logInfo('splitDefineLines: removed (no-op)');
   return text;
 }
 
@@ -449,7 +451,7 @@ export function formatText(text: string, options?: { commentsStyle?: string; rep
       }).join('\n');
     }
   }
-  if (process.env.FGL_FMT_DEBUG) console.log('formatText: splitDefineLines invocation removed (disabled)');
+  if (process.env.FGL_FMT_DEBUG) logInfo('formatText: splitDefineLines invocation removed (disabled)');
   // apply indentation normalization last so wrapping doesn't get confused by tabs/spaces differences
   out = normalizeIndentation(out, indentOpt);
   return out;

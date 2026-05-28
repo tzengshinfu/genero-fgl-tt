@@ -1,6 +1,7 @@
 import * as fs from "fs";
 import * as path from "path";
 import { ImportType } from "./importTypes";
+import { logError } from "../utils/logger";
 
 export interface Package extends Info {
     type: string;
@@ -70,7 +71,7 @@ export function parsePackageClasses(importList: ImportType[]) {
         try {
             importPackages.push(importPackage);
         } catch (error) {
-            console.log(error);
+            logError(error);
         }
     });
     return importPackages;
@@ -98,7 +99,7 @@ function whatPackage(packageName: string) {
             return json;
         }
     } catch (err) {
-        console.error("[Genero FGL] Failed to load package definition", p, err);
+        logError("[Genero FGL] Failed to load package definition", p, err);
     }
 
     return null;

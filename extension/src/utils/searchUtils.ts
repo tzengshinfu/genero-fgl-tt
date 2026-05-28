@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
+import { logError } from './logger';
 
 const SUPPORTED_EXTENSIONS = new Set(['.4gl', '.per']);
 
@@ -27,7 +28,7 @@ async function walkDirectoryForFiles(
       }
     }
   } catch (err) {
-    console.error(`[Genero FGL] Error scanning library directory ${dirPath}:`, err);
+    logError(`[Genero FGL] Error scanning library directory ${dirPath}:`, err);
   }
   return files;
 }
@@ -90,7 +91,7 @@ export async function getPrioritizedFiles(
         }
       }
     } catch (err) {
-      console.error(`[Genero FGL] Error reading library path ${p}:`, err);
+      logError(`[Genero FGL] Error reading library path ${p}:`, err);
     }
   }
 

@@ -35,10 +35,31 @@ import { URI } from 'vscode-uri';
 import { KEYWORDS_4GL, KEYWORDS_PER } from './providers/keywords';
 import { parsePackageClasses, Package, PackageClass, Method } from './Handlers/packageHandler';
 import { ImportType } from './Handlers/importTypes';
+import { logError, logInfo, logWarn, setLogWriter } from './utils/logger';
 
 const connection = createConnection(ProposedFeatures.all);
+setLogWriter((level, message) => {
+  if (level === 'error') {
+    connection.console.error(message);
+    return;
+  }
+
+  if (level === 'warn') {
+    connection.console.warn(message);
+    return;
+  }
+
+  connection.console.log(message);
+});
 const documents: TextDocuments<TextDocument> = new TextDocuments(TextDocument);
 const workspaceFolders = new Set<string>();
+const workspaceFunctionRecordsByUri = new Map<string, FunctionDefinitionRecord[]>();
+const diagnosticBucketsByUri = new Map<string, { unused: Diagnostic[]; semantic: Diagnostic[] }>();
+const pendingDiagnosticTimers = new Map<string, NodeJS.Timeout>();
+const pendingSemanticTokenRefreshTimers = new Map<string, NodeJS.Timeout>();
+let workspaceFunctionCacheInitialized = false;
+const DIAGNOSTIC_DEBOUNCE_MS = 2500;
+const SEMANTIC_TOKENS_REFRESH_DEBOUNCE_MS = 80;
 const SEMANTIC_TOKEN_TYPES = ['function', 'parameter', 'variable', 'type', 'keyword'] as const;
 const SEMANTIC_TOKEN_TYPE_INDEX: Record<(typeof SEMANTIC_TOKEN_TYPES)[number], number> = {
   function: 0,
@@ -48,11 +69,13 @@ const SEMANTIC_TOKEN_TYPE_INDEX: Record<(typeof SEMANTIC_TOKEN_TYPES)[number], n
   keyword: 4
 };
 
-console.log('[LSP Server] Starting Genero FGL Language Server');
+logInfo('[LSP Server] Starting Genero FGL Language Server');
 
 connection.onInitialize((params: InitializeParams): InitializeResult => {
-  console.log('[LSP Server] onInitialize called');
+  logInfo('[LSP Server] onInitialize called');
   workspaceFolders.clear();
+  workspaceFunctionRecordsByUri.clear();
+  workspaceFunctionCacheInitialized = false;
   for (const folder of params.workspaceFolders ?? []) {
     if (folder.uri.startsWith('file:')) {
       workspaceFolders.add(URI.parse(folder.uri).fsPath);
@@ -63,7 +86,11 @@ connection.onInitialize((params: InitializeParams): InitializeResult => {
   }
   return {
     capabilities: {
-      textDocumentSync: TextDocumentSyncKind.Incremental,
+      textDocumentSync: {
+        openClose: true,
+        change: TextDocumentSyncKind.Incremental,
+        save: true
+      },
       hoverProvider: true,
       definitionProvider: true,
       semanticTokensProvider: {
@@ -92,28 +119,89 @@ connection.onInitialize((params: InitializeParams): InitializeResult => {
 });
 
 connection.onInitialized(() => {
-  console.log('[LSP Server] onInitialized - server is ready');
+  logInfo('[LSP Server] onInitialized - server is ready');
 });
 
 documents.onDidOpen((event) => {
-  console.log('[LSP Server] Document opened:', event.document.uri, 'languageId:', event.document.languageId);
-  void validateDocument(event.document);
+  logInfo('[LSP Server] Document opened:', event.document.uri, 'languageId:', event.document.languageId);
+  updateFunctionDefinitionCache(event.document);
+  cancelScheduledValidation(event.document.uri);
+  void validateAllDiagnostics(event.document);
 });
 
 documents.onDidChangeContent((change) => {
-  console.log('[LSP Server] Document changed:', change.document.uri);
-  void validateDocument(change.document);
+  logInfo('[LSP Server] Document changed:', change.document.uri);
+  updateFunctionDefinitionCache(change.document);
+  scheduleSemanticTokensRefresh(change.document.uri);
+  clearSemanticDiagnostics(change.document.uri);
+  scheduleValidation(change.document);
+});
+
+documents.onDidSave((event) => {
+  logInfo('[LSP Server] Document saved:', event.document.uri);
+  updateFunctionDefinitionCache(event.document);
+  cancelScheduledValidation(event.document.uri);
+  void validateAllDiagnostics(event.document);
 });
 
 documents.onDidClose((event) => {
+  cancelScheduledValidation(event.document.uri);
+  cancelScheduledSemanticTokensRefresh(event.document.uri);
+  restoreFunctionDefinitionCacheForUri(event.document.uri);
+  diagnosticBucketsByUri.delete(event.document.uri);
   connection.sendDiagnostics({ uri: event.document.uri, diagnostics: [] });
 });
 
 connection.onDidChangeConfiguration(() => {
-  for (const document of documents.all()) {
-    void validateDocument(document);
+  for (const timer of pendingDiagnosticTimers.values()) {
+    clearTimeout(timer);
   }
+  pendingDiagnosticTimers.clear();
+  for (const timer of pendingSemanticTokenRefreshTimers.values()) {
+    clearTimeout(timer);
+  }
+  pendingSemanticTokenRefreshTimers.clear();
+  for (const document of documents.all()) {
+    void validateAllDiagnostics(document);
+  }
+  void connection.languages.semanticTokens.refresh();
 });
+
+function cancelScheduledValidation(uri: string): void {
+  const timer = pendingDiagnosticTimers.get(uri);
+  if (!timer) {
+    return;
+  }
+
+  clearTimeout(timer);
+  pendingDiagnosticTimers.delete(uri);
+}
+
+function scheduleValidation(document: TextDocument): void {
+  cancelScheduledValidation(document.uri);
+  pendingDiagnosticTimers.set(document.uri, setTimeout(() => {
+    pendingDiagnosticTimers.delete(document.uri);
+    void validateUnusedDiagnostics(document);
+  }, DIAGNOSTIC_DEBOUNCE_MS));
+}
+
+function cancelScheduledSemanticTokensRefresh(uri: string): void {
+  const timer = pendingSemanticTokenRefreshTimers.get(uri);
+  if (!timer) {
+    return;
+  }
+
+  clearTimeout(timer);
+  pendingSemanticTokenRefreshTimers.delete(uri);
+}
+
+function scheduleSemanticTokensRefresh(uri: string): void {
+  cancelScheduledSemanticTokensRefresh(uri);
+  pendingSemanticTokenRefreshTimers.set(uri, setTimeout(() => {
+    pendingSemanticTokenRefreshTimers.delete(uri);
+    void connection.languages.semanticTokens.refresh();
+  }, SEMANTIC_TOKENS_REFRESH_DEBOUNCE_MS));
+}
 
 function getKeywords(languageId: string): { name: string; type?: string; description?: string; documentation?: string }[] {
   if (languageId === 'per') return KEYWORDS_PER;
@@ -148,6 +236,12 @@ interface FunctionBlock {
   endLine: number;
 }
 
+interface GlobalsBlock {
+  content: string;
+  startLine: number;
+  endLine: number;
+}
+
 interface FunctionDefinitionRecord {
   uri: string;
   block: FunctionBlock;
@@ -177,6 +271,109 @@ interface EnhancedFunctionSignature {
 function stripInlineComment(line: string): string {
   if (!line) return line;
   return line.replace(/#.*/g, '').replace(/--.*$/, '');
+}
+
+function maskNonCodePreserveColumns(text: string): string[] {
+  const lines = text.split(/\r?\n/);
+  const maskedLines: string[] = [];
+  let inBlockComment = false;
+
+  for (const sourceLine of lines) {
+    const chars = sourceLine.split('');
+
+    for (let index = 0; index < chars.length; index++) {
+      if (inBlockComment) {
+        if (chars[index] === '}') {
+          chars[index] = ' ';
+          inBlockComment = false;
+        } else {
+          chars[index] = ' ';
+        }
+        continue;
+      }
+
+      if (chars[index] === '\'') {
+        chars[index] = ' ';
+        index++;
+        while (index < chars.length) {
+          const currentChar = chars[index];
+          if (currentChar === '\'' && chars[index + 1] === '\'') {
+            chars[index] = ' ';
+            chars[index + 1] = ' ';
+            index += 2;
+            continue;
+          }
+
+          chars[index] = ' ';
+          if (currentChar === '\'') {
+            break;
+          }
+          index++;
+        }
+        continue;
+      }
+
+      if (chars[index] === '"') {
+        chars[index] = ' ';
+        index++;
+        while (index < chars.length) {
+          const currentChar = chars[index];
+          if (currentChar === '"' && chars[index + 1] === '"') {
+            chars[index] = ' ';
+            chars[index + 1] = ' ';
+            index += 2;
+            continue;
+          }
+
+          chars[index] = ' ';
+          if (currentChar === '"') {
+            break;
+          }
+          index++;
+        }
+        continue;
+      }
+
+      if (chars[index] === '`') {
+        chars[index] = ' ';
+        index++;
+        while (index < chars.length) {
+          const isClosingBacktick = chars[index] === '`';
+          chars[index] = ' ';
+          if (isClosingBacktick) {
+            break;
+          }
+          index++;
+        }
+        continue;
+      }
+
+      const nextChar = index + 1 < chars.length ? chars[index + 1] : '';
+      if (chars[index] === '{') {
+        chars[index] = ' ';
+        inBlockComment = true;
+        continue;
+      }
+
+      if (chars[index] === '#') {
+        for (let rest = index; rest < chars.length; rest++) {
+          chars[rest] = ' ';
+        }
+        break;
+      }
+
+      if (chars[index] === '-' && nextChar === '-') {
+        for (let rest = index; rest < chars.length; rest++) {
+          chars[rest] = ' ';
+        }
+        break;
+      }
+    }
+
+    maskedLines.push(chars.join(''));
+  }
+
+  return maskedLines;
 }
 
 function extractMainBlock(text: string): { content: string; startLine: number; endLine: number } | null {
@@ -215,6 +412,39 @@ function extractFunctionBlocks(text: string): FunctionBlock[] {
       current = null;
     }
   }
+  return blocks;
+}
+
+function extractGlobalsBlocks(text: string): GlobalsBlock[] {
+  const lines = text.split(/\r?\n/);
+  const blocks: GlobalsBlock[] = [];
+  let startLine = -1;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = stripInlineComment(lines[i]).trim();
+    if (/^\s*GLOBALS\b/i.test(line)) {
+      startLine = i;
+      continue;
+    }
+
+    if (startLine !== -1 && REGEX_PATTERNS.END_GLOBALS.test(line)) {
+      blocks.push({
+        content: lines.slice(startLine, i + 1).join('\n'),
+        startLine,
+        endLine: i
+      });
+      startLine = -1;
+    }
+  }
+
+  if (startLine !== -1) {
+    blocks.push({
+      content: lines.slice(startLine).join('\n'),
+      startLine,
+      endLine: lines.length - 1
+    });
+  }
+
   return blocks;
 }
 
@@ -536,10 +766,87 @@ function countArguments(argumentText: string): number {
   return count;
 }
 
+function collectFunctionDefinitionRecordsFromText(text: string, uri: string): FunctionDefinitionRecord[] {
+  return extractFunctionBlocks(text).map(block => ({
+    uri,
+    block,
+    signature: parseEnhancedFunctionSignature(block.content)
+  }));
+}
+
+function ensureWorkspaceFunctionCache(): void {
+  if (workspaceFunctionCacheInitialized) {
+    return;
+  }
+
+  for (const filePath of collectWorkspaceFiles(['.4gl'])) {
+    const uri = URI.file(filePath).toString();
+    if (workspaceFunctionRecordsByUri.has(uri)) {
+      continue;
+    }
+
+    try {
+      const text = fs.readFileSync(filePath, 'utf8');
+      workspaceFunctionRecordsByUri.set(uri, collectFunctionDefinitionRecordsFromText(text, uri));
+    } catch (error) {
+      logError('[LSP] Error building function cache for', filePath, error);
+    }
+  }
+
+  workspaceFunctionCacheInitialized = true;
+}
+
+function updateFunctionDefinitionCache(document: TextDocument): void {
+  if (document.languageId !== '4gl') {
+    return;
+  }
+
+  workspaceFunctionRecordsByUri.set(document.uri, collectFunctionDefinitionRecordsFromText(document.getText(), document.uri));
+}
+
+function restoreFunctionDefinitionCacheForUri(uri: string): void {
+  if (!uri.startsWith('file:')) {
+    workspaceFunctionRecordsByUri.delete(uri);
+    return;
+  }
+
+  try {
+    const filePath = URI.parse(uri).fsPath;
+    if (!filePath.toLowerCase().endsWith('.4gl') || !fs.existsSync(filePath)) {
+      workspaceFunctionRecordsByUri.delete(uri);
+      return;
+    }
+
+    const text = fs.readFileSync(filePath, 'utf8');
+    workspaceFunctionRecordsByUri.set(uri, collectFunctionDefinitionRecordsFromText(text, uri));
+  } catch (error) {
+    workspaceFunctionRecordsByUri.delete(uri);
+    logError('[LSP] Error restoring function cache for', uri, error);
+  }
+}
+
+function getFunctionDefinitionIndex(): Map<string, FunctionDefinitionRecord> {
+  ensureWorkspaceFunctionCache();
+
+  const index = new Map<string, FunctionDefinitionRecord>();
+  for (const records of workspaceFunctionRecordsByUri.values()) {
+    for (const record of records) {
+      const key = record.block.name.toLowerCase();
+      if (!index.has(key)) {
+        index.set(key, record);
+      }
+    }
+  }
+
+  return index;
+}
+
 function collectSemanticTokens(text: string): SemanticTokenEntry[] {
   const tokens: SemanticTokenEntry[] = [];
   const seen = new Set<string>();
   const lines = text.split(/\r?\n/);
+  const maskedLines = maskNonCodePreserveColumns(text);
+  const maskedText = maskedLines.join('\n');
   const keywordNames = Array.from(new Set(KEYWORDS_4GL.map(keyword => keyword.name.toUpperCase()))).sort((a, b) => b.length - a.length);
 
   const pushToken = (line: number, char: number, length: number, tokenType: (typeof SEMANTIC_TOKEN_TYPES)[number]) => {
@@ -558,11 +865,21 @@ function collectSemanticTokens(text: string): SemanticTokenEntry[] {
     }
   };
 
-  const mainBlock = extractMainBlock(text);
+  const mainBlock = extractMainBlock(maskedText);
   if (mainBlock) {
     for (const variable of parseDefineStatements(mainBlock.content, mainBlock.startLine, 'main')) {
-      pushWordOccurrences(variable.line, lines[variable.line] || '', variable.name, 'variable');
-      const typeIndex = (lines[variable.line] || '').toUpperCase().indexOf(variable.type.toUpperCase());
+      pushWordOccurrences(variable.line, maskedLines[variable.line] || '', variable.name, 'variable');
+      const typeIndex = (maskedLines[variable.line] || '').toUpperCase().indexOf(variable.type.toUpperCase());
+      if (typeIndex >= 0) {
+        pushToken(variable.line, typeIndex, variable.type.length, 'type');
+      }
+    }
+  }
+
+  for (const block of extractGlobalsBlocks(maskedText)) {
+    for (const variable of parseDefineStatements(block.content, block.startLine, 'global')) {
+      pushWordOccurrences(variable.line, maskedLines[variable.line] || '', variable.name, 'variable');
+      const typeIndex = (maskedLines[variable.line] || '').toUpperCase().indexOf(variable.type.toUpperCase());
       if (typeIndex >= 0) {
         pushToken(variable.line, typeIndex, variable.type.length, 'type');
       }
@@ -570,7 +887,7 @@ function collectSemanticTokens(text: string): SemanticTokenEntry[] {
   }
 
   for (let i = 0; i < lines.length; i++) {
-    const line = stripInlineComment(lines[i]);
+    const line = maskedLines[i] || '';
 
     const functionMatch = line.match(REGEX_PATTERNS.FUNCTION);
     if (functionMatch) {
@@ -597,15 +914,15 @@ function collectSemanticTokens(text: string): SemanticTokenEntry[] {
     }
   }
 
-  for (const block of extractFunctionBlocks(text)) {
+  for (const block of extractFunctionBlocks(maskedText)) {
     const signature = parseEnhancedFunctionSignature(block.content);
-    const signatureLine = lines[block.startLine] || '';
+    const signatureLine = maskedLines[block.startLine] || '';
     if (signature) {
       for (const parameter of signature.allParameters) {
         pushWordOccurrences(block.startLine, signatureLine, parameter, 'parameter');
       }
       for (let line = block.startLine + 1; line <= block.endLine; line++) {
-        const textLine = stripInlineComment(lines[line] || '');
+        const textLine = maskedLines[line] || '';
         for (const parameter of signature.allParameters) {
           pushWordOccurrences(line, textLine, parameter, 'parameter');
         }
@@ -613,8 +930,8 @@ function collectSemanticTokens(text: string): SemanticTokenEntry[] {
     }
 
     for (const variable of parseDefineStatements(block.content, block.startLine, 'function')) {
-      pushWordOccurrences(variable.line, lines[variable.line] || '', variable.name, 'variable');
-      const typeIndex = (lines[variable.line] || '').toUpperCase().indexOf(variable.type.toUpperCase());
+      pushWordOccurrences(variable.line, maskedLines[variable.line] || '', variable.name, 'variable');
+      const typeIndex = (maskedLines[variable.line] || '').toUpperCase().indexOf(variable.type.toUpperCase());
       if (typeIndex >= 0) {
         pushToken(variable.line, typeIndex, variable.type.length, 'type');
       }
@@ -640,21 +957,11 @@ function buildSemanticTokens(text: string): SemanticTokens {
 async function buildSemanticDiagnostics(document: TextDocument): Promise<Diagnostic[]> {
   const diagnostics: Diagnostic[] = [];
   const text = document.getText();
-  const signatureCache = new Map<string, Promise<FunctionDefinitionRecord | null>>();
-
-  const resolveFunction = (name: string): Promise<FunctionDefinitionRecord | null> => {
-    const key = name.toLowerCase();
-    let record = signatureCache.get(key);
-    if (!record) {
-      record = findFunctionDefinitionRecord(name, document.uri, text);
-      signatureCache.set(key, record);
-    }
-    return record;
-  };
+  const definitionIndex = getFunctionDefinitionIndex();
 
   for (const block of extractFunctionBlocks(text)) {
     for (const call of collectFunctionCallOccurrences(block)) {
-      const definition = await resolveFunction(call.name);
+      const definition = definitionIndex.get(call.name.toLowerCase()) ?? null;
       if (!definition) {
         diagnostics.push({
           range: call.range,
@@ -691,21 +998,100 @@ async function isDiagnosticEnabled(): Promise<boolean> {
   }
 }
 
-async function validateDocument(document: TextDocument): Promise<void> {
-  if (document.languageId !== '4gl') {
-    connection.sendDiagnostics({ uri: document.uri, diagnostics: [] });
+function getDiagnosticBuckets(uri: string): { unused: Diagnostic[]; semantic: Diagnostic[] } {
+  let buckets = diagnosticBucketsByUri.get(uri);
+  if (!buckets) {
+    buckets = { unused: [], semantic: [] };
+    diagnosticBucketsByUri.set(uri, buckets);
+  }
+  return buckets;
+}
+
+function sendMergedDiagnostics(uri: string): void {
+  const buckets = diagnosticBucketsByUri.get(uri);
+  if (!buckets) {
+    connection.sendDiagnostics({ uri, diagnostics: [] });
     return;
+  }
+
+  connection.sendDiagnostics({
+    uri,
+    diagnostics: [...buckets.unused, ...buckets.semantic]
+  });
+}
+
+function updateDiagnosticBucket(uri: string, bucket: 'unused' | 'semantic', diagnostics: Diagnostic[]): void {
+  const buckets = getDiagnosticBuckets(uri);
+  buckets[bucket] = diagnostics;
+  sendMergedDiagnostics(uri);
+}
+
+function clearSemanticDiagnostics(uri: string): void {
+  const buckets = getDiagnosticBuckets(uri);
+  if (buckets.semantic.length === 0) {
+    return;
+  }
+
+  buckets.semantic = [];
+  sendMergedDiagnostics(uri);
+}
+
+async function canValidateDocument(document: TextDocument): Promise<boolean> {
+  if (document.languageId !== '4gl') {
+    diagnosticBucketsByUri.delete(document.uri);
+    connection.sendDiagnostics({ uri: document.uri, diagnostics: [] });
+    return false;
   }
   if (!await isDiagnosticEnabled()) {
+    diagnosticBucketsByUri.delete(document.uri);
     connection.sendDiagnostics({ uri: document.uri, diagnostics: [] });
+    return false;
+  }
+  return true;
+}
+
+async function validateUnusedDiagnostics(document: TextDocument): Promise<void> {
+  if (!await canValidateDocument(document)) {
     return;
   }
+
   try {
-    const diagnostics = buildUnusedVariableDiagnostics(document.getText());
-    diagnostics.push(...await buildSemanticDiagnostics(document));
-    connection.sendDiagnostics({ uri: document.uri, diagnostics });
+    updateDiagnosticBucket(document.uri, 'unused', buildUnusedVariableDiagnostics(document.getText()));
   } catch (error) {
-    console.error('[LSP] validateDocument failed', error);
+    logError('[LSP] validateUnusedDiagnostics failed', error);
+    updateDiagnosticBucket(document.uri, 'unused', []);
+  }
+}
+
+async function validateSemanticDiagnostics(document: TextDocument): Promise<void> {
+  if (!await canValidateDocument(document)) {
+    return;
+  }
+
+  try {
+    updateDiagnosticBucket(document.uri, 'semantic', await buildSemanticDiagnostics(document));
+  } catch (error) {
+    logError('[LSP] validateSemanticDiagnostics failed', error);
+    updateDiagnosticBucket(document.uri, 'semantic', []);
+  }
+}
+
+async function validateAllDiagnostics(document: TextDocument): Promise<void> {
+  if (!await canValidateDocument(document)) {
+    return;
+  }
+
+  try {
+    const unusedDiagnostics = buildUnusedVariableDiagnostics(document.getText());
+    const semanticDiagnostics = await buildSemanticDiagnostics(document);
+    diagnosticBucketsByUri.set(document.uri, {
+      unused: unusedDiagnostics,
+      semantic: semanticDiagnostics
+    });
+    sendMergedDiagnostics(document.uri);
+  } catch (error) {
+    logError('[LSP] validateAllDiagnostics failed', error);
+    diagnosticBucketsByUri.delete(document.uri);
     connection.sendDiagnostics({ uri: document.uri, diagnostics: [] });
   }
 }
@@ -792,7 +1178,7 @@ async function findDefinition(name: string, currentUri: string, currentText: str
       const found = findDefinitionInText(text, name, URI.file(filePath).toString());
       if (found) return found;
     } catch (error) {
-      console.error('[LSP] Error searching definition in', filePath, error);
+      logError('[LSP] Error searching definition in', filePath, error);
     }
   }
 
@@ -843,7 +1229,7 @@ async function findFunctionSignature(name: string, currentUri: string, currentTe
         return signature;
       }
     } catch (error) {
-      console.error('[LSP] Error searching signature in', filePath, error);
+      logError('[LSP] Error searching signature in', filePath, error);
     }
   }
 
@@ -867,7 +1253,7 @@ async function findFunctionDefinitionRecord(name: string, currentUri: string, cu
         return record;
       }
     } catch (error) {
-      console.error('[LSP] Error searching function definition record in', filePath, error);
+      logError('[LSP] Error searching function definition record in', filePath, error);
     }
   }
 
@@ -1009,7 +1395,7 @@ function readTextByUri(uri: string, currentUri: string, currentText: string): st
   try {
     return fs.readFileSync(URI.parse(uri).fsPath, 'utf8');
   } catch (error) {
-    console.error('[LSP] Error reading uri for rename', uri, error);
+    logError('[LSP] Error reading uri for rename', uri, error);
     return null;
   }
 }
@@ -1244,7 +1630,7 @@ async function findReferences(target: RenameTarget, currentUri: string, currentT
       const text = fs.readFileSync(filePath, 'utf8');
       references.push(...collectReferenceLocationsInText(text, target, URI.file(filePath).toString(), includeDeclaration));
     } catch (error) {
-      console.error('[LSP] Error searching references in', filePath, error);
+      logError('[LSP] Error searching references in', filePath, error);
     }
   }
 
@@ -1272,7 +1658,7 @@ function buildRenameWorkspaceEdit(target: RenameTarget, newName: string, current
       const text = fs.readFileSync(filePath, 'utf8');
       pushFileEdits(URI.file(filePath).toString(), text);
     } catch (error) {
-      console.error('[LSP] Error building rename edits for', filePath, error);
+      logError('[LSP] Error building rename edits for', filePath, error);
     }
   }
 
@@ -1629,10 +2015,10 @@ function importCompletionLsp(
 
 connection.onCompletion((params): CompletionItem[] => {
   try {
-    console.log('[LSP] ===== onCompletion CALLED =====', params.textDocument.uri, params.position);
+    logInfo('[LSP] ===== onCompletion CALLED =====', params.textDocument.uri, params.position);
     const doc = documents.get(params.textDocument.uri);
     if (!doc) {
-      console.log('[LSP] Document not found!');
+      logWarn('[LSP] Document not found!');
       return [];
     }
 
@@ -1647,7 +2033,7 @@ connection.onCompletion((params): CompletionItem[] => {
     const lines = fullText.split(/\r?\n/);
     const lineText = lines[params.position.line] || '';
 
-    console.log('[LSP] Completion triggered - word:', word, 'wordLower:', wordLower, 'languageId:', doc.languageId);
+    logInfo('[LSP] Completion triggered - word:', word, 'wordLower:', wordLower, 'languageId:', doc.languageId);
 
     const keywords = getKeywords(doc.languageId);
     const items: CompletionItem[] = [];
@@ -1682,13 +2068,13 @@ connection.onCompletion((params): CompletionItem[] => {
         }
       }
     } catch (err) {
-      console.error('[LSP] Package completion failed', err);
+      logError('[LSP] Package completion failed', err);
     }
 
-    console.log('[LSP] Returning', items.length, 'completion items, first 3:', items.slice(0, 3).map(i => i.label));
+    logInfo('[LSP] Returning', items.length, 'completion items, first 3:', items.slice(0, 3).map(i => i.label));
     return items;
   } catch (err) {
-    console.error('[LSP] FATAL: onCompletion crashed:', err);
+    logError('[LSP] FATAL: onCompletion crashed:', err);
     return [];
   }
 });
@@ -1878,4 +2264,4 @@ function mapCompletionKind(type?: string): CompletionItemKind {
 documents.listen(connection);
 connection.listen();
 
-console.log('[LSP Server] Now listening for requests...');
+logInfo('[LSP Server] Now listening for requests...');

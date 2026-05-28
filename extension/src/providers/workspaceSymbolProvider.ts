@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { parseSymbols, Sym } from '../parser';
 import { getPrioritizedFiles } from '../utils/searchUtils';
+import { logError } from '../utils/logger';
 
 /**
  * WorkspaceSymbolProvider - 在整個工作區中搜索符號（函數、報表、RECORD、TYPE）
@@ -40,11 +41,11 @@ export class WorkspaceSymbolProvider implements vscode.WorkspaceSymbolProvider {
           );
           symbols.push(...fileSymbols);
         } catch (err) {
-          console.error(`[Genero FGL] Error parsing file ${fileUri.fsPath}:`, err);
+          logError(`[Genero FGL] Error parsing file ${fileUri.fsPath}:`, err);
         }
       }
     } catch (err) {
-      console.error('[Genero FGL] Error in workspace symbol search:', err);
+      logError('[Genero FGL] Error in workspace symbol search:', err);
     }
 
     return symbols;
@@ -92,7 +93,7 @@ export class WorkspaceSymbolProvider implements vscode.WorkspaceSymbolProvider {
       const parsed = parseSymbols(text);
       this.collectSymbols(parsed, symbols, document.uri, query);
     } catch (err) {
-      console.error(`[Genero FGL] Symbol parsing error for ${document.uri.fsPath}:`, err);
+      logError(`[Genero FGL] Symbol parsing error for ${document.uri.fsPath}:`, err);
     }
 
     // 備用：簡單的正則表達式搜索（如果解析失敗）

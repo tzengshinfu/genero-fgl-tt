@@ -10,6 +10,7 @@ import { mergeCompletionResultsWithSnippets } from './providers/snippetProvider'
 import { LanguageClient, LanguageClientOptions, ServerOptions, TransportKind } from 'vscode-languageclient/node';
 import { getPrioritizedFiles } from './utils/searchUtils';
 import { computeFoldingRanges } from './folding';
+import { logError, logInfo, setLogWriter } from './utils/logger';
 
 // Clean, single-file implementation for DocumentSymbols, DefinitionProvider
 // and unused-variable diagnostics for Genero 4GL.
@@ -37,12 +38,10 @@ interface EnhancedFunctionSignature {
   allParameters: string[];
 }
 
-let foldingOutputChannel: vscode.OutputChannel | undefined;
+let extensionOutputChannel: vscode.OutputChannel | undefined;
 
 function logFolding(...parts: unknown[]) {
-  const message = parts.map(part => typeof part === 'string' ? part : JSON.stringify(part)).join(' ');
-  console.log(message);
-  foldingOutputChannel?.appendLine(message);
+  logInfo(...parts);
 }
 
 async function probeFoldingRanges(document: vscode.TextDocument | undefined, reason: string) {
@@ -188,7 +187,7 @@ export function parseDocumentSymbols(text: string): vscode.DocumentSymbol[] {
       }
     }
   } catch (err) {
-    console.error('[Genero FGL] parseDocumentSymbols error', err);
+    logError('[Genero FGL] parseDocumentSymbols error', err);
   }
 
   // push groups in expected order if they have children
@@ -390,7 +389,7 @@ class UnusedVariableDiagnosticProvider {
 
       this.diagnosticCollection.set(document.uri, diagnostics);
     } catch (err) {
-      console.error('[Genero FGL] updateDiagnostics error', err);
+      logError('[Genero FGL] updateDiagnostics error', err);
       this.diagnosticCollection.delete(document.uri);
     }
   }
@@ -403,6 +402,72 @@ function getDiagnosticDelay(): number { const cfg = vscode.workspace.getConfigur
 
 let diagnosticTimer: NodeJS.Timeout | undefined;
 let languageClient: LanguageClient | undefined;
+
+function mergeCompletionResultsWithLocalFallback(
+  document: vscode.TextDocument,
+  position: vscode.Position,
+  lspResult: vscode.CompletionItem[] | vscode.CompletionList<vscode.CompletionItem> | null | undefined,
+  localResult: vscode.CompletionItem[]
+): vscode.CompletionItem[] | vscode.CompletionList<vscode.CompletionItem> {
+  if (!lspResult) {
+    return mergeCompletionResultsWithSnippets(document, position, localResult) ?? localResult;
+  }
+
+  if (Array.isArray(lspResult)) {
+    return mergeCompletionResultsWithSnippets(document, position, [...lspResult, ...localResult]) ?? [...lspResult, ...localResult];
+  }
+
+  return mergeCompletionResultsWithSnippets(document, position, new vscode.CompletionList(
+    [...(lspResult.items ?? []), ...localResult],
+    lspResult.isIncomplete
+  )) ?? localResult;
+}
+
+function getCompletionResultCount(result: vscode.CompletionItem[] | vscode.CompletionList<vscode.CompletionItem> | null | undefined): number {
+  if (!result) {
+    return 0;
+  }
+
+  return Array.isArray(result) ? result.length : (result.items?.length ?? 0);
+}
+
+function logCompletionSource(
+  document: vscode.TextDocument,
+  position: vscode.Position,
+  source: 'lsp-only' | 'lsp+local' | 'local-fallback-timeout' | 'local-fallback-error' | 'local-fallback-empty',
+  lspResult: vscode.CompletionItem[] | vscode.CompletionList<vscode.CompletionItem> | null | undefined,
+  localResult: vscode.CompletionItem[]
+) {
+  const lspCount = getCompletionResultCount(lspResult);
+  const localCount = localResult.length;
+  const mergedCount = source === 'lsp-only'
+    ? lspCount
+    : source === 'lsp+local'
+      ? getCompletionResultCount(mergeCompletionResultsWithLocalFallback(document, position, lspResult, localResult))
+      : localCount;
+
+  logInfo(
+    '[Client] Completion source =',
+    source,
+    'uri=', document.uri.toString(),
+    'line=', position.line,
+    'char=', position.character,
+    'lspItems=', lspCount,
+    'localItems=', localCount,
+    'returnedItems=', mergedCount
+  );
+}
+
+function getCompletionTimeoutMs(
+  completionContext: vscode.CompletionContext,
+  localResult: vscode.CompletionItem[]
+): number {
+  if (localResult.length > 0) {
+    return completionContext.triggerKind === vscode.CompletionTriggerKind.Invoke ? 120 : 80;
+  }
+
+  return completionContext.triggerKind === vscode.CompletionTriggerKind.Invoke ? 400 : 250;
+}
 
 // --- Definition provider -------------------------------------------------
 class FourGLDefinitionProvider implements vscode.DefinitionProvider {
@@ -436,7 +501,7 @@ class FourGLDefinitionProvider implements vscode.DefinitionProvider {
         }
         checkedFiles.add(f.toString());
       } catch (err) {
-        console.error(`[Genero FGL] Error searching definition in ${f.fsPath}`, err);
+        logError(`[Genero FGL] Error searching definition in ${f.fsPath}`, err);
       }
     }
 
@@ -485,8 +550,12 @@ class FourGLCommentFoldingProvider implements vscode.FoldingRangeProvider {
 
 // --- Activation ----------------------------------------------------------
 export function activate(context: vscode.ExtensionContext) {
-  foldingOutputChannel = vscode.window.createOutputChannel('Genero FGL Folding');
-  context.subscriptions.push(foldingOutputChannel);
+  extensionOutputChannel = vscode.window.createOutputChannel('Genero FGL');
+  context.subscriptions.push(extensionOutputChannel);
+  setLogWriter((level, message) => {
+    const prefix = level === 'error' ? '[ERROR]' : level === 'warn' ? '[WARN]' : '[INFO]';
+    extensionOutputChannel?.appendLine(`${prefix} ${message}`);
+  });
   logFolding('[Genero FGL] activating');
 
   const cfg = vscode.workspace.getConfiguration('GeneroFGL');
@@ -511,7 +580,7 @@ export function activate(context: vscode.ExtensionContext) {
       if (!found) {
         vscode.window.showWarningMessage('Genero FGL: language server enabled but no server files found in the extension bundle. Language server features will be unavailable.');
       } else {
-        console.log('[Genero FGL] language server candidate found at', found);
+        logInfo('[Genero FGL] language server candidate found at', found);
 
         const lspDebugBreak = process && process.env && process.env.FGL_LSP_DEBUG === '1';
         const lspExecArgv = lspDebugBreak
@@ -526,20 +595,52 @@ export function activate(context: vscode.ExtensionContext) {
           }
         };
         const localCompletionProvider = new CompletionProvider();
+        const languageServerOutputChannel = vscode.window.createOutputChannel('Genero FGL Language Server');
+        context.subscriptions.push(languageServerOutputChannel);
         const clientOptions: LanguageClientOptions = {
           documentSelector: [{ language: '4gl' }, { language: 'per' }],
+          outputChannel: languageServerOutputChannel,
           synchronize: { configurationSection: 'GeneroFGL' },
           middleware: {
             provideCompletionItem: async (document, position, completionContext, token, next) => {
-              console.log('[Client] provideCompletionItem middleware called for', document.uri.toString(), 'at', position);
-              const result = await next(document, position, completionContext, token);
-              console.log('[Client] LSP returned:', result ? (Array.isArray(result) ? result.length + ' items' : 'CompletionList with ' + result.items?.length + ' items') : 'null/undefined');
-              const merged = mergeCompletionResultsWithSnippets(document, position, result);
-              if (!result) {
-                console.log('[Client] LSP returned empty, using merged local snippets/completions');
-                return merged;
+              logInfo('[Client] provideCompletionItem middleware called for', document.uri.toString(), 'at', position);
+              const localResult = localCompletionProvider.provideCompletionItems(document, position);
+              const completionTimeoutMs = getCompletionTimeoutMs(completionContext, localResult);
+
+              try {
+                let didTimeout = false;
+                const result = await Promise.race([
+                  next(document, position, completionContext, token),
+                  new Promise<null>(resolve => setTimeout(() => {
+                    didTimeout = true;
+                    resolve(null);
+                  }, completionTimeoutMs))
+                ]);
+
+                logInfo('[Client] LSP returned:', result ? (Array.isArray(result) ? result.length + ' items' : 'CompletionList with ' + result.items?.length + ' items') : 'null/undefined or timed out', 'timeoutMs=', completionTimeoutMs);
+                if (didTimeout) {
+                  logCompletionSource(document, position, 'local-fallback-timeout', result, localResult);
+                  return mergeCompletionResultsWithLocalFallback(document, position, null, localResult);
+                }
+
+                const lspCount = getCompletionResultCount(result);
+                if (lspCount === 0) {
+                  logCompletionSource(document, position, 'local-fallback-empty', result, localResult);
+                  return mergeCompletionResultsWithLocalFallback(document, position, null, localResult);
+                }
+
+                if (localResult.length === 0) {
+                  logCompletionSource(document, position, 'lsp-only', result, localResult);
+                } else {
+                  logCompletionSource(document, position, 'lsp+local', result, localResult);
+                }
+
+                return mergeCompletionResultsWithLocalFallback(document, position, result, localResult);
+              } catch (error) {
+                logError('[Client] Completion request failed, falling back to local completions', error);
+                logCompletionSource(document, position, 'local-fallback-error', null, localResult);
+                return mergeCompletionResultsWithLocalFallback(document, position, null, localResult);
               }
-              return merged;
             }
           }
         };
@@ -549,7 +650,7 @@ export function activate(context: vscode.ExtensionContext) {
       }
     }
   } catch (err) {
-    console.error('[Genero FGL] language-server check failed', err);
+    logError('[Genero FGL] language-server check failed', err);
   }
 
   context.subscriptions.push(vscode.languages.registerDocumentSymbolProvider({ language: '4gl' }, { provideDocumentSymbols(document: vscode.TextDocument) { return parseDocumentSymbols(document.getText()); } }));
@@ -579,7 +680,7 @@ export function activate(context: vscode.ExtensionContext) {
   const docFormatter: vscode.DocumentFormattingEditProvider = {
     provideDocumentFormattingEdits(document: vscode.TextDocument): vscode.TextEdit[] {
       try {
-        console.log('[Genero FGL] provideDocumentFormattingEdits called for', document.uri.toString());
+        logInfo('[Genero FGL] provideDocumentFormattingEdits called for', document.uri.toString());
         const cfg = vscode.workspace.getConfiguration('GeneroFGL');
         const fmtEnabled = cfg.get('4gl.format.enable', true);
         if (!fmtEnabled) return [];
@@ -593,22 +694,22 @@ export function activate(context: vscode.ExtensionContext) {
             size: cfg.get('4gl.format.indent.size', 3)
           }
         };
-        console.log('[Genero FGL] formatting options =', JSON.stringify(options));
+        logInfo('[Genero FGL] formatting options =', JSON.stringify(options));
         const full = document.getText();
         const formatted = formatter.formatText(full, options);
         // Avoid huge logs: show a short preview plus lengths
         if (process && process.stdout && process.env && process.env.FGL_FMT_DEBUG) {
-          console.log('[Genero FGL] formatted length=', formatted.length, 'original length=', full.length);
-          console.log('[Genero FGL] formatted preview:\n', formatted.split('\n').slice(0, 40).join('\n'));
+          logInfo('[Genero FGL] formatted length=', formatted.length, 'original length=', full.length);
+          logInfo('[Genero FGL] formatted preview:\n', formatted.split('\n').slice(0, 40).join('\n'));
         } else {
           const preview = formatted.split('\n').slice(0, 20).join('\n');
-          console.log('[Genero FGL] formatted preview (truncated):\n', preview);
+          logInfo('[Genero FGL] formatted preview (truncated):\n', preview);
         }
-        if (formatted === full) { console.log('[Genero FGL] format produced no changes'); return []; }
+        if (formatted === full) { logInfo('[Genero FGL] format produced no changes'); return []; }
         const fullRange = new vscode.Range(0, 0, document.lineCount - 1, document.lineAt(document.lineCount - 1).range.end.character);
         return [vscode.TextEdit.replace(fullRange, formatted)];
       } catch (err) {
-        console.error('[Genero FGL] document format error', err);
+        logError('[Genero FGL] document format error', err);
         return [];
       }
     }
@@ -618,7 +719,7 @@ export function activate(context: vscode.ExtensionContext) {
   const rangeFormatter: vscode.DocumentRangeFormattingEditProvider = {
     provideDocumentRangeFormattingEdits(document: vscode.TextDocument, range: vscode.Range): vscode.TextEdit[] {
       try {
-        console.log('[Genero FGL] provideDocumentRangeFormattingEdits called for', document.uri.toString(), 'range=', range.start.line, '-', range.end.line);
+        logInfo('[Genero FGL] provideDocumentRangeFormattingEdits called for', document.uri.toString(), 'range=', range.start.line, '-', range.end.line);
         const cfg = vscode.workspace.getConfiguration('GeneroFGL');
         const fmtEnabled = cfg.get('4gl.format.enable', true);
         if (!fmtEnabled) return [];
@@ -632,14 +733,14 @@ export function activate(context: vscode.ExtensionContext) {
             size: cfg.get('4gl.format.indent.size', 3)
           }
         };
-        console.log('[Genero FGL] range formatting options =', JSON.stringify(options));
+        logInfo('[Genero FGL] range formatting options =', JSON.stringify(options));
         const text = document.getText(range);
         const formatted = formatter.formatText(text, options);
-        console.log('[Genero FGL] range formatted preview (truncated):\n', formatted.split('\n').slice(0, 20).join('\n'));
-        if (formatted === text) { console.log('[Genero FGL] range format produced no changes'); return []; }
+        logInfo('[Genero FGL] range formatted preview (truncated):\n', formatted.split('\n').slice(0, 20).join('\n'));
+        if (formatted === text) { logInfo('[Genero FGL] range format produced no changes'); return []; }
         return [vscode.TextEdit.replace(range, formatted)];
       } catch (err) {
-        console.error('[Genero FGL] range format error', err); return [];
+        logError('[Genero FGL] range format error', err); return [];
       }
     }
   };
@@ -648,9 +749,9 @@ export function activate(context: vscode.ExtensionContext) {
   // Commands for formatting
   context.subscriptions.push(vscode.commands.registerCommand('genero-fgl.format.document', async () => {
     const ae = vscode.window.activeTextEditor; if (!ae || ae.document.languageId !== '4gl') { vscode.window.showWarningMessage('請在 .4gl 檔案中執行'); return; }
-  console.log('[Genero FGL] command genero-fgl.format.document invoked, active document=', ae.document.uri.toString());
+  logInfo('[Genero FGL] command genero-fgl.format.document invoked, active document=', ae.document.uri.toString());
     const cfg = vscode.workspace.getConfiguration('GeneroFGL');
-    console.log('[Genero FGL] command formatting options =', JSON.stringify({
+    logInfo('[Genero FGL] command formatting options =', JSON.stringify({
       commentsStyle: cfg.get('4gl.format.comments.style', 'preserve'),
       replaceInline: cfg.get('4gl.format.comments.replaceInline', false),
       keywordsUppercase: cfg.get('4gl.format.keywords.uppercase.enable', true),
@@ -661,9 +762,9 @@ export function activate(context: vscode.ExtensionContext) {
 
   context.subscriptions.push(vscode.commands.registerCommand('genero-fgl.format.function', async (args?: { range?: vscode.Range }) => {
     const ae = vscode.window.activeTextEditor; if (!ae || ae.document.languageId !== '4gl') { vscode.window.showWarningMessage('請在 .4gl 檔案中執行'); return; }
-  console.log('[Genero FGL] command genero-fgl.format.function invoked, active document=', ae.document.uri.toString());
+  logInfo('[Genero FGL] command genero-fgl.format.function invoked, active document=', ae.document.uri.toString());
   const cfgCmd = vscode.workspace.getConfiguration('GeneroFGL');
-  console.log('[Genero FGL] command function-format options =', JSON.stringify({
+  logInfo('[Genero FGL] command function-format options =', JSON.stringify({
     commentsStyle: cfgCmd.get('4gl.format.comments.style', 'preserve'),
     replaceInline: cfgCmd.get('4gl.format.comments.replaceInline', false),
     keywordsUppercase: cfgCmd.get('4gl.format.keywords.uppercase.enable', true),
@@ -717,7 +818,7 @@ export function activate(context: vscode.ExtensionContext) {
     }));
   }
 
-  console.log('[Genero FGL] activated');
+  logInfo('[Genero FGL] activated');
 }
 
 export function deactivate() {

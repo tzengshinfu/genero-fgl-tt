@@ -3,6 +3,7 @@ import { KEYWORDS_4GL, KEYWORDS_PER } from './keywords';
 import { getImportList, importCompletion } from '../Handlers/importHandler';
 import { parsePackageClasses } from '../Handlers/packageHandler';
 import { buildSnippetCompletions } from './snippetProvider';
+import { logError } from '../utils/logger';
 
 export class CompletionProvider implements vscode.CompletionItemProvider {
   public provideCompletionItems(
@@ -63,7 +64,7 @@ export class CompletionProvider implements vscode.CompletionItemProvider {
         }
       }
     } catch (err) {
-      console.error('[Genero FGL] completion package analysis failed', err);
+      logError('[Genero FGL] completion package analysis failed', err);
     }
 
     for (const item of buildSnippetCompletions(document, position, word, wordRange)) {

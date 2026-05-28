@@ -4,6 +4,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import { logError } from '../utils/logger';
 
 interface KeywordItem {
   name: string;
@@ -27,7 +28,7 @@ function loadKeywords(fileName: string): KeywordItem[] {
     if (Array.isArray(parsed)) return parsed as KeywordItem[];
     if (parsed && Array.isArray(parsed.keywords)) return parsed.keywords as KeywordItem[];
   } catch (err) {
-    console.error('[Genero FGL] Failed to load keywords', fileName, err);
+    logError('[Genero FGL] Failed to load keywords', fileName, err);
   }
 
   return [];

@@ -327,6 +327,33 @@
         "path": "./syntaxes/per.tmLanguage.json"
       }
     ],
+    "semanticTokenScopes": [
+      {
+        "language": "4gl",
+        "scopes": {
+          "keyword": [
+            "keyword.control.4gl"
+          ],
+          "type": [
+            "storage.type.4gl",
+            "entity.name.type.4gl"
+          ],
+          "variable": [
+            "variable.other.field.4gl",
+            "variable.other.4gl"
+          ],
+          "parameter": [
+            "variable.parameter.4gl",
+            "variable.other.field.4gl"
+          ],
+          "function": [
+            "entity.name.function.4gl",
+            "support.function.4gl",
+            "keyword.control.4gl"
+          ]
+        }
+      }
+    ],
     "commands": [
       {
         "command": "genero-fgl.runDiagnostics",
