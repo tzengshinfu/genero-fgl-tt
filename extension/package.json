@@ -214,7 +214,7 @@
             "type": "string"
           },
           "default": [],
-          "description": "Public library paths (file or directory). Workspace symbol search prioritizes these paths in order."
+          "description": "Glob patterns for public library .4gl files. Relative paths are resolved from each workspace root. Supports * and ? wildcards in the filename component. Examples: \"tiptop/lib/4gl/cl_*.4gl\", \"tiptop/aws/4gl/aws*.4gl\". Absolute directory paths are also supported."
         },
         "GeneroFGL.4gl.definition.enable": {
           "type": "boolean",

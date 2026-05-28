@@ -1194,10 +1194,67 @@ function collectWorkspaceFiles(extensions: string[]): string[] {
   return files;
 }
 
+function matchGlobPattern(filename: string, pattern: string): boolean {
+  const escaped = pattern
+    .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+    .replace(/\*/g, '.*')
+    .replace(/\?/g, '.');
+  return new RegExp(`^${escaped}$`, 'i').test(filename);
+}
+
+function collectLibraryFilesFromPattern(globPattern: string, out: string[]): void {
+  const normalized = globPattern.replace(/[\\/]/g, path.sep);
+  const pathsToTry: string[] = path.isAbsolute(normalized)
+    ? [normalized]
+    : Array.from(workspaceFolders).map(wsRoot => path.join(wsRoot, normalized));
+
+  for (const resolvedPattern of pathsToTry) {
+    const dir = path.dirname(resolvedPattern);
+    const filePattern = path.basename(resolvedPattern);
+
+    if (!filePattern.includes('*') && !filePattern.includes('?')) {
+      try {
+        if (fs.existsSync(resolvedPattern)) {
+          const stat = fs.statSync(resolvedPattern);
+          if (stat.isDirectory()) {
+            collectFilesRecursive(resolvedPattern, ['.4gl'], out);
+          } else {
+            out.push(resolvedPattern);
+          }
+        }
+      } catch {
+        // skip inaccessible paths
+      }
+      continue;
+    }
+
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (entry.isFile() && matchGlobPattern(entry.name, filePattern)) {
+        out.push(path.join(dir, entry.name));
+      }
+    }
+  }
+}
+
 function collectLibraryFiles(extensions: string[]): string[] {
+  const seen = new Set<string>();
   const files: string[] = [];
-  for (const libDir of libraryPathsList) {
-    collectFilesRecursive(libDir, extensions, files);
+  for (const libPattern of libraryPathsList) {
+    const expanded: string[] = [];
+    collectLibraryFilesFromPattern(libPattern, expanded);
+    for (const f of expanded) {
+      const norm = path.normalize(f);
+      if (!seen.has(norm) && extensions.some(ext => norm.toLowerCase().endsWith(ext.toLowerCase()))) {
+        seen.add(norm);
+        files.push(f);
+      }
+    }
   }
   return files;
 }
