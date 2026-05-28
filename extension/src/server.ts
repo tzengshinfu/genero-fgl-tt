@@ -58,6 +58,9 @@ const diagnosticBucketsByUri = new Map<string, { unused: Diagnostic[]; semantic:
 const pendingDiagnosticTimers = new Map<string, NodeJS.Timeout>();
 const pendingSemanticTokenRefreshTimers = new Map<string, NodeJS.Timeout>();
 let workspaceFunctionCacheInitialized = false;
+let libraryPathsList: string[] = [];
+const libraryFunctionRecordsByUri = new Map<string, FunctionDefinitionRecord[]>();
+let libraryFunctionCacheInitialized = false;
 const DIAGNOSTIC_DEBOUNCE_MS = 2500;
 const SEMANTIC_TOKENS_REFRESH_DEBOUNCE_MS = 80;
 const SEMANTIC_TOKEN_TYPES = ['function', 'parameter', 'variable', 'type', 'keyword'] as const;
@@ -118,8 +121,9 @@ connection.onInitialize((params: InitializeParams): InitializeResult => {
   };
 });
 
-connection.onInitialized(() => {
+connection.onInitialized(async () => {
   logInfo('[LSP Server] onInitialized - server is ready');
+  await refreshLibraryPathsAndCache();
 });
 
 documents.onDidOpen((event) => {
@@ -152,7 +156,7 @@ documents.onDidClose((event) => {
   connection.sendDiagnostics({ uri: event.document.uri, diagnostics: [] });
 });
 
-connection.onDidChangeConfiguration(() => {
+connection.onDidChangeConfiguration(async () => {
   for (const timer of pendingDiagnosticTimers.values()) {
     clearTimeout(timer);
   }
@@ -161,6 +165,7 @@ connection.onDidChangeConfiguration(() => {
     clearTimeout(timer);
   }
   pendingSemanticTokenRefreshTimers.clear();
+  await refreshLibraryPathsAndCache();
   for (const document of documents.all()) {
     void validateAllDiagnostics(document);
   }
@@ -796,6 +801,36 @@ function ensureWorkspaceFunctionCache(): void {
   workspaceFunctionCacheInitialized = true;
 }
 
+function ensureLibraryFunctionCache(): void {
+  if (libraryFunctionCacheInitialized) return;
+  for (const filePath of collectLibraryFiles(['.4gl'])) {
+    const uri = URI.file(filePath).toString();
+    if (libraryFunctionRecordsByUri.has(uri)) continue;
+    try {
+      const text = fs.readFileSync(filePath, 'utf8');
+      libraryFunctionRecordsByUri.set(uri, collectFunctionDefinitionRecordsFromText(text, uri));
+    } catch (error) {
+      logError('[LSP] Error building library function cache for', filePath, error);
+    }
+  }
+  libraryFunctionCacheInitialized = true;
+}
+
+async function refreshLibraryPathsAndCache(): Promise<void> {
+  try {
+    const paths = await connection.workspace.getConfiguration('GeneroFGL.4gl.library.paths');
+    libraryPathsList = Array.isArray(paths)
+      ? paths.filter((p): p is string => typeof p === 'string' && p.length > 0)
+      : [];
+  } catch {
+    libraryPathsList = [];
+  }
+  libraryFunctionRecordsByUri.clear();
+  libraryFunctionCacheInitialized = false;
+  ensureLibraryFunctionCache();
+  logInfo('[LSP Server] Library paths refreshed, count:', libraryPathsList.length);
+}
+
 function updateFunctionDefinitionCache(document: TextDocument): void {
   if (document.languageId !== '4gl') {
     return;
@@ -825,16 +860,34 @@ function restoreFunctionDefinitionCacheForUri(uri: string): void {
   }
 }
 
-function getFunctionDefinitionIndex(): Map<string, FunctionDefinitionRecord> {
+function getFunctionDefinitionIndex(currentUri?: string): Map<string, FunctionDefinitionRecord> {
+  ensureLibraryFunctionCache();
   ensureWorkspaceFunctionCache();
 
   const index = new Map<string, FunctionDefinitionRecord>();
-  for (const records of workspaceFunctionRecordsByUri.values()) {
+
+  // ① 當前開啟的文件（最優先）
+  if (currentUri) {
+    for (const record of workspaceFunctionRecordsByUri.get(currentUri) ?? []) {
+      const key = record.block.name.toLowerCase();
+      if (!index.has(key)) index.set(key, record);
+    }
+  }
+
+  // ② Library paths 下的函式庫
+  for (const records of libraryFunctionRecordsByUri.values()) {
     for (const record of records) {
       const key = record.block.name.toLowerCase();
-      if (!index.has(key)) {
-        index.set(key, record);
-      }
+      if (!index.has(key)) index.set(key, record);
+    }
+  }
+
+  // ③ 其他 Workspace 檔案
+  for (const [uri, records] of workspaceFunctionRecordsByUri.entries()) {
+    if (currentUri && uri === currentUri) continue;
+    for (const record of records) {
+      const key = record.block.name.toLowerCase();
+      if (!index.has(key)) index.set(key, record);
     }
   }
 
@@ -957,7 +1010,7 @@ function buildSemanticTokens(text: string): SemanticTokens {
 async function buildSemanticDiagnostics(document: TextDocument): Promise<Diagnostic[]> {
   const diagnostics: Diagnostic[] = [];
   const text = document.getText();
-  const definitionIndex = getFunctionDefinitionIndex();
+  const definitionIndex = getFunctionDefinitionIndex(document.uri);
 
   for (const block of extractFunctionBlocks(text)) {
     for (const call of collectFunctionCallOccurrences(block)) {
@@ -965,7 +1018,7 @@ async function buildSemanticDiagnostics(document: TextDocument): Promise<Diagnos
       if (!definition) {
         diagnostics.push({
           range: call.range,
-          severity: DiagnosticSeverity.Warning,
+          severity: DiagnosticSeverity.Hint,
           source: 'Genero FGL',
           code: 'undefined-function',
           message: `找不到函式 '${call.name}' 的定義`
@@ -1141,6 +1194,14 @@ function collectWorkspaceFiles(extensions: string[]): string[] {
   return files;
 }
 
+function collectLibraryFiles(extensions: string[]): string[] {
+  const files: string[] = [];
+  for (const libDir of libraryPathsList) {
+    collectFilesRecursive(libDir, extensions, files);
+  }
+  return files;
+}
+
 function collectFilesRecursive(root: string, extensions: string[], out: string[]): void {
   let entries: fs.Dirent[];
   try {
@@ -1169,6 +1230,18 @@ async function findDefinition(name: string, currentUri: string, currentText: str
 
   const currentPath = currentUri.startsWith('file:') ? URI.parse(currentUri).fsPath : currentUri;
   const seen = new Set<string>([path.normalize(currentPath)]);
+  for (const filePath of collectLibraryFiles(['.4gl'])) {
+    const normalized = path.normalize(filePath);
+    if (seen.has(normalized)) continue;
+    seen.add(normalized);
+    try {
+      const text = fs.readFileSync(filePath, 'utf8');
+      const found = findDefinitionInText(text, name, URI.file(filePath).toString());
+      if (found) return found;
+    } catch (error) {
+      logError('[LSP] Error searching definition in library', filePath, error);
+    }
+  }
   for (const filePath of collectWorkspaceFiles(['.4gl'])) {
     const normalized = path.normalize(filePath);
     if (seen.has(normalized)) continue;
@@ -1218,6 +1291,18 @@ async function findFunctionSignature(name: string, currentUri: string, currentTe
 
   const currentPath = currentUri.startsWith('file:') ? URI.parse(currentUri).fsPath : currentUri;
   const seen = new Set<string>([path.normalize(currentPath)]);
+  for (const filePath of collectLibraryFiles(['.4gl'])) {
+    const normalized = path.normalize(filePath);
+    if (seen.has(normalized)) continue;
+    seen.add(normalized);
+    try {
+      const text = fs.readFileSync(filePath, 'utf8');
+      const signature = findFunctionSignatureInText(text, name);
+      if (signature) return signature;
+    } catch (error) {
+      logError('[LSP] Error searching signature in library', filePath, error);
+    }
+  }
   for (const filePath of collectWorkspaceFiles(['.4gl'])) {
     const normalized = path.normalize(filePath);
     if (seen.has(normalized)) continue;
@@ -1242,6 +1327,18 @@ async function findFunctionDefinitionRecord(name: string, currentUri: string, cu
 
   const currentPath = currentUri.startsWith('file:') ? URI.parse(currentUri).fsPath : currentUri;
   const seen = new Set<string>([path.normalize(currentPath)]);
+  for (const filePath of collectLibraryFiles(['.4gl'])) {
+    const normalized = path.normalize(filePath);
+    if (seen.has(normalized)) continue;
+    seen.add(normalized);
+    try {
+      const text = fs.readFileSync(filePath, 'utf8');
+      const record = findFunctionDefinitionRecordInText(text, name, URI.file(filePath).toString());
+      if (record) return record;
+    } catch (error) {
+      logError('[LSP] Error searching function definition record in library', filePath, error);
+    }
+  }
   for (const filePath of collectWorkspaceFiles(['.4gl'])) {
     const normalized = path.normalize(filePath);
     if (seen.has(normalized)) continue;
